@@ -197,7 +197,86 @@ Inside `scoped_versions`, `compare_version()` is called with `'*'` as an argumen
 
 ---
 
-### BUG-4: Last Batch Progress Bar Update is Zero When Total is Exact Multiple (LOW)
+### BUG-4: `portaction` Returns Empty Table Instead of `nil` for 0-CVE Products (HIGH)
+
+**File:** `cvescannerv2.nse:908, 980-984`
+
+**Observed on:** Host 195.201.149.167, nginx 1.26.3 on ports 80, 443, and 2100.
+
+When a product is detected and matched (e.g., nginx 1.26.3) but has genuinely 0 CVEs in the database (all version ranges exclude it), the following flow occurs:
+
+1. `portaction` matches CPEs for nginx 1.26.3 → `matches['size'] > 0`
+2. Calls `analysis()` which queries the CVE database
+3. nginx 1.26.3 has 0 CVEs — all version ranges in the DB exclude it (e.g., CVE-2023-44487 ends at 1.25.2, CVE-2025-23419 excludes exactly 1.26.3)
+4. `analysis()` returns `{}` (empty table) at line 908
+5. `portaction` returns this `{}` at line 984
+6. Nmap's NSE engine sees a non-nil return that produces no string output → **"Bug in cvescannerv2: no string output"**
+
+```lua
+-- Line 908: analysis returns {} when no CVEs found
+return vulns  -- vulns = {} (empty table, which is non-nil in Lua)
+
+-- Line 980-984: portaction passes it through unchanged
+local vulns
+if matches['size'] ~= 0 then
+   vulns = analysis(host, port, matches)
+end
+return vulns  -- returns {} instead of nil
+```
+
+Nmap's NSE engine expects portrule action functions to return either `nil` (no output) or a table/string that produces visible output. An empty table `{}` is non-nil but generates no string, triggering the "no string output" warning.
+
+**Recommended Fix:** `portaction` should return `nil` when vulns is empty:
+
+```lua
+if matches['size'] ~= 0 then
+   vulns = analysis(host, port, matches)
+end
+if vulns and #vulns == 0 then
+   return nil
+end
+return vulns
+```
+
+---
+
+### BUG-5: Zero-CVE Results Not Cached, Causing Redundant Queries (MEDIUM)
+
+**File:** `cvescannerv2.nse:846-866`
+
+**Observed on:** Host 195.201.149.167, nginx 1.26.3 on ports 80, 443, and 2100.
+
+When a product/version lookup yields 0 CVEs, the result is **not cached**. The cache write on line 865 is gated by `if nvulns > 0` (line 849):
+
+```lua
+if not registry.cache[fmt('%s|%s|%s', product, v, vu)] then
+   tmp_vulns = vulnerabilities(host, port, cpe, product, info)
+   local nvulns = table.remove(tmp_vulns, 1)
+   if nvulns > 0 then
+      -- ... cache write only happens here (line 865)
+      registry.cache[fmt('%s|%s|%s', product, v, vu)] = { nvulns, tmp_vulns }
+   end
+   -- nvulns == 0 falls through with no cache write
+```
+
+Because the cache is never populated for 0-CVE products, every subsequent port with the same product/version bypasses the cache (`registry.cache[key]` is still nil) and re-enters the `vulnerabilities()` function, re-executing all the expensive SQL queries against the database.
+
+**Impact:** When scanning nginx 1.26.3 across ports 80, 443, and 2100, the same database queries for `nginx|1.26.3|*` run **3 times** instead of being cached after the first lookup. For scans with many ports sharing the same service, this multiplies query cost linearly.
+
+**Recommended Fix:** Cache 0-CVE results as well:
+
+```lua
+if nvulns > 0 then
+   -- ... existing formatting and cache write
+   registry.cache[fmt('%s|%s|%s', product, v, vu)] = { nvulns, tmp_vulns }
+else
+   registry.cache[fmt('%s|%s|%s', product, v, vu)] = { 0, {} }
+end
+```
+
+---
+
+### BUG-6: Last Batch Progress Bar Update is Zero When Total is Exact Multiple (LOW)
 
 **File:** `extra/database.py:556-579`
 
@@ -218,7 +297,7 @@ cve_l = cves % CONST["cve"] or CONST["cve"]
 
 ---
 
-### BUG-5: Infinite Retry Loop in `update_metasploit()` (LOW)
+### BUG-7: Infinite Retry Loop in `update_metasploit()` (LOW)
 
 **File:** `extra/database.py:625-632`
 
@@ -239,7 +318,7 @@ If `sql.OperationalError` occurs persistently (e.g., corrupted database), this l
 
 ---
 
-### BUG-6: Database Cursors Not Closed on Error (LOW)
+### BUG-8: Database Cursors Not Closed on Error (LOW)
 
 **File:** `cvescannerv2.nse:506-553`
 
@@ -247,7 +326,7 @@ In `dump_exploit()`, three cursors are opened (lines 506, 518, 542) but none hav
 
 ---
 
-### BUG-7: `typo` in database.py tqdm description (COSMETIC)
+### BUG-9: Typo in database.py tqdm description (COSMETIC)
 
 **File:** `extra/database.py:619`
 
@@ -374,14 +453,16 @@ Converting lists to sets on every flush is O(n) and loses insertion order. For l
 | Category    | Critical | High | Medium | Low | Cosmetic |
 |-------------|----------|------|--------|-----|----------|
 | Security    | 1        | 1    | 2      | 3   | 0        |
-| Bugs        | 0        | 1    | 2      | 3   | 1        |
+| Bugs        | 0        | 2    | 3      | 3   | 1        |
 | Performance | 0        | 3    | 2      | 2   | 0        |
-| **Total**   | **1**    | **5**| **6**  | **8**| **1**   |
+| **Total**   | **1**    | **6**| **7**  | **8**| **1**   |
 
 ### Top Priority Items
 1. **SEC-1:** SQL injection in NSE script (Critical)
 2. **BUG-1:** Column mismatch causing crashes when version is empty (High)
-3. **SEC-2:** Nil dereference in `valid_json()` (High)
-4. **PERF-1:** 204 sequential HTTP requests per port (High)
-5. **PERF-2:** N+1 query pattern in `dump_exploit()` (High)
-6. **PERF-3:** Missing database indexes (High)
+3. **BUG-4:** `portaction` returns empty table triggering Nmap "no string output" warning (High)
+4. **SEC-2:** Nil dereference in `valid_json()` (High)
+5. **BUG-5:** Zero-CVE results not cached, causing redundant queries on multi-port hosts (Medium)
+6. **PERF-1:** 204 sequential HTTP requests per port (High)
+7. **PERF-2:** N+1 query pattern in `dump_exploit()` (High)
+8. **PERF-3:** Missing database indexes (High)
