@@ -7,14 +7,14 @@
 # Copyright (C) 2021-2025 Sergio Chica Manjarrez @ pervasive.it.uc3m.es.
 # Universidad Carlos III de Madrid.
 
-# This file is part of CVEScannerV2.
+# This file is part of CVEScannerV3.
 
-# CVEScannerV2 is free software: you can redistribute it and/or modify
+# CVEScannerV3 is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-# CVEScannerV2 is distributed in the hope that it will be useful,
+# CVEScannerV3 is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
@@ -30,9 +30,9 @@ import sqlite3 as sql
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from threading import Event, Thread
 
 import httpx
@@ -86,7 +86,7 @@ CONST = {
     "bat": 25,
 }
 COPYRIGHT = """
-CVEScannerV2  Copyright (C) 2022-2025 Sergio Chica Manjarrez @ pervasive.it.uc3m.es.
+CVEScannerV3  Copyright (C) 2022-2025 Sergio Chica Manjarrez @ pervasive.it.uc3m.es.
 Universidad Carlos III de Madrid.
 This program comes with ABSOLUTELY NO WARRANTY; for details check below.
 This is free software, and you are welcome to redistribute it
@@ -188,6 +188,19 @@ class Database:
             );
 
             PRAGMA foreign_keys = ON;
+
+            CREATE INDEX IF NOT EXISTS idx_products_product
+                ON products(product);
+            CREATE INDEX IF NOT EXISTS idx_products_product_version
+                ON products(product, version);
+            CREATE INDEX IF NOT EXISTS idx_referenced_exploit_cve
+                ON referenced_exploit(cve_id);
+            CREATE INDEX IF NOT EXISTS idx_referenced_metasploit_cve
+                ON referenced_metasploit(cve_id);
+            CREATE INDEX IF NOT EXISTS idx_affected_product
+                ON affected(product_id);
+            CREATE INDEX IF NOT EXISTS idx_multiaffected_product
+                ON multiaffected(product_id);
             """
         )
 
@@ -339,7 +352,7 @@ class Database:
 
 
 def now():
-    return datetime.isoformat(datetime.utcnow())
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _norm(string):
@@ -388,19 +401,17 @@ class PopulateDBThread(Thread):
             self.setup_execm(db)
             try:
                 while True:
-                    if not self.queue.empty():
-                        dtype, data = self.queue.get()
+                    try:
+                        dtype, data = self.queue.get(timeout=1)
                         self.datalist[dtype].append(data)
-                    else:
+                    except Empty:
                         if self.insert.is_set():
                             self.insert.clear()
                             for dt in range(len(self.execmany)):
-                                self.execmany[dt](set(self.datalist[dt]))
+                                self.execmany[dt](self.datalist[dt])
                                 self.datalist[dt] = []
                         elif self.finished.is_set():
                             break
-                        else:
-                            time.sleep(1)
             except Exception:
                 print(traceback.format_exc())
                 os._exit(1)
@@ -409,10 +420,10 @@ class PopulateDBThread(Thread):
 @LIMITER.ratelimit("identity", delay=True)
 def query_api(args):
     try:
-        url, cl, bar, thread_objs, batch, populate = args
+        url, bar, thread_objs, batch, populate = args
         _, ev_ins, queue = thread_objs
         try:
-            resp = cl.get(url)
+            resp = httpx.get(url, timeout=120, headers={"apiKey": KEY})
         except httpx.TimeoutException:
             print(traceback.format_exc())
             return
@@ -527,79 +538,80 @@ def update_db(args, thread_objs, populate=False):
     else:
         print("[+] Creating database...")
 
-    with httpx.Client(timeout=120, headers={"apiKey": KEY}) as cl:
-        print("[*] Retrieving CVEs/CPEs metadata...")
-        try:
-            resp = cl.get(
-                f"{URL['nvd'].format('cpes', 0)}&resultsPerPage=1{extra}"
-            )
-        except httpx.HTTPError as e:
-            print(e)
-            os._exit(1)
-        if resp.status_code != 200:
-            print(f"[!] Error retrieving information from NVD API: {resp.text}")
-            os._exit(-1)
-        try:
-            cpes = resp.json()["totalResults"]
-        except Exception:
-            print(traceback.format_exc())
-            os._exit(1)
-        resp = cl.get(
-            f"{URL['nvd'].format('cves', 0)}" f"&resultsPerPage=1{extra}"
+    api_headers = {"apiKey": KEY}
+    print("[*] Retrieving CVEs/CPEs metadata...")
+    try:
+        resp = httpx.get(
+            f"{URL['nvd'].format('cpes', 0)}&resultsPerPage=1{extra}",
+            timeout=120, headers=api_headers,
         )
-        try:
-            cves = resp.json()["totalResults"]
-        except Exception:
-            print(traceback.format_exc())
-            os._exit(1)
-        print(f"[+] Metadata: {cpes} CPEs | {cves} CVEs")
-        cve_q, cpe_q = -(-cves // CONST["cve"]), -(-cpes // CONST["cpe"])
-        cve_l, cpe_l = cves % CONST["cve"], cpes % CONST["cpe"]
-        time.sleep(5)
+    except httpx.HTTPError as e:
+        print(e)
+        os._exit(1)
+    if resp.status_code != 200:
+        print(f"[!] Error retrieving information from NVD API: {resp.text}")
+        os._exit(-1)
+    try:
+        cpes = resp.json()["totalResults"]
+    except Exception:
+        print(traceback.format_exc())
+        os._exit(1)
+    resp = httpx.get(
+        f"{URL['nvd'].format('cves', 0)}&resultsPerPage=1{extra}",
+        timeout=120, headers=api_headers,
+    )
+    try:
+        cves = resp.json()["totalResults"]
+    except Exception:
+        print(traceback.format_exc())
+        os._exit(1)
+    print(f"[+] Metadata: {cpes} CPEs | {cves} CVEs")
+    cve_q, cpe_q = -(-cves // CONST["cve"]), -(-cpes // CONST["cpe"])
+    cve_l = cves % CONST["cve"] or CONST["cve"]
+    cpe_l = cpes % CONST["cpe"] or CONST["cpe"]
+    time.sleep(5)
 
-        if cpes:
-            with tqdm(
-                total=cpes, ascii=" =", desc="[+] Retrieving CPEs"
-            ) as bar:
-                q_args = []
-                idx = 0
-                with ThreadPoolExecutor() as tpe:
-                    for _ in range(cpe_q):
-                        q_args.append(
-                            [
-                                f"{URL['nvd'].format('cpes', idx)}{extra}",
-                                cl,
-                                bar,
-                                thread_objs,
-                                CONST["cpe"],
-                                populate,
-                            ]
-                        )
-                        idx += CONST["cpe"]
-                    q_args[-1][-2] = cpe_l  # last batch
-                    tpe.map(query_api, q_args)
+    if cpes:
+        with tqdm(
+            total=cpes, ascii=" =", desc="[+] Retrieving CPEs"
+        ) as bar:
+            q_args = []
+            idx = 0
+            with ThreadPoolExecutor() as tpe:
+                for _ in range(cpe_q):
+                    q_args.append(
+                        [
+                            f"{URL['nvd'].format('cpes', idx)}{extra}",
+                            bar,
+                            thread_objs,
+                            CONST["cpe"],
+                            populate,
+                        ]
+                    )
+                    idx += CONST["cpe"]
+                q_args[-1][-2] = cpe_l  # last batch
+                tpe.map(query_api, q_args)
 
-        if cves:
-            with tqdm(
-                total=cves, ascii=" =", desc="[+] Retrieving CVEs"
-            ) as bar:
-                q_args = []
-                idx = 0
-                with ThreadPoolExecutor() as tpe:
-                    for _ in range(cve_q):
-                        q_args.append(
-                            [
-                                f"{URL['nvd'].format('cves', idx)}{extra}",
-                                cl,
-                                bar,
-                                thread_objs,
-                                CONST["cve"],
-                                populate,
-                            ]
-                        )
-                        idx += CONST["cve"]
-                    q_args[-1][-2] = cve_l  # last batch
-                    tpe.map(query_api, q_args)
+    if cves:
+        with tqdm(
+            total=cves, ascii=" =", desc="[+] Retrieving CVEs"
+        ) as bar:
+            q_args = []
+            idx = 0
+            with ThreadPoolExecutor() as tpe:
+                for _ in range(cve_q):
+                    q_args.append(
+                        [
+                            f"{URL['nvd'].format('cves', idx)}{extra}",
+                            bar,
+                            thread_objs,
+                            CONST["cve"],
+                            populate,
+                        ]
+                    )
+                    idx += CONST["cve"]
+                q_args[-1][-2] = cve_l  # last batch
+                tpe.map(query_api, q_args)
 
 
 def update_metasploit(args, thread_objs):
@@ -615,18 +627,22 @@ def update_metasploit(args, thread_objs):
         os._exit(1)
     with Database(args.database) as db:
         for vuln in tqdm(
-            cache, ascii=" =", desc="[+] Retrieving metastploit data"
+            cache, ascii=" =", desc="[+] Retrieving metasploit data"
         ):
             name = cache[vuln]["fullname"]
             thread_objs[2].put((4, (name,)))
             for ref in cache[vuln]["references"]:
                 match = RE["cve"].match(ref)
                 if match is not None:
-                    while True:
+                    max_retries = 10
+                    for attempt in range(max_retries):
                         try:
                             if db.cached_cve(ref):
                                 thread_objs[2].put((8, (ref, name)))
                         except sql.OperationalError:
+                            if attempt == max_retries - 1:
+                                print(f"[!] Failed to query CVE {ref} after {max_retries} retries")
+                                break
                             time.sleep(2)
                         else:
                             break
@@ -643,13 +659,15 @@ def scrape_title(exploit):
             timeout=120,
         )
         decoded = html.unescape(page.text)
-        title = RE["tit"].search(decoded).group(3)  # group 1 and 2 are quotes
+        match = RE["tit"].search(decoded)
+        if match:
+            title = match.group(3)  # group 1 and 2 are quotes
     except httpx.HTTPError as e:
         print(e)
         os._exit(1)
     finally:
         time.sleep(delay)
-        return title, exploit
+    return title, exploit
 
 
 def exploit_batch(exploits):
@@ -680,7 +698,7 @@ def update_exploitdb(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Tool to generate/update CVEScannerV2 database"
+        description="Tool to generate/update CVEScannerV3 database"
     )
     parser.add_argument(
         "-d", "--database", default="cve.db", type=Path, help="Database file path"

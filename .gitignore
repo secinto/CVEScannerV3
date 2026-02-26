@@ -1,5 +1,6 @@
 # Custom
 CVEScannerV2DB/
+CVEScannerV3DB/
 tmp/
 cve.db
 .api

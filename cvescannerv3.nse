@@ -1,18 +1,18 @@
 -- SPDX-License-Identifier: GPL-3.0-or-later
 
--- cvescannerv2 - NSE script.
+-- cvescannerv3 - NSE script.
 
 -- Copyright (C) 2021-2025 Sergio Chica Manjarrez @ pervasive.it.uc3m.es.
 -- Universidad Carlos III de Madrid.
 
--- This file is part of CVEScannerV2.
+-- This file is part of CVEScannerV3.
 
--- CVEScannerV2 is free software: you can redistribute it and/or modify
+-- CVEScannerV3 is free software: you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
 -- the Free Software Foundation, either version 3 of the License, or
 -- (at your option) any later version.
 
--- CVEScannerV2 is distributed in the hope that it will be useful,
+-- CVEScannerV3 is distributed in the hope that it will be useful,
 -- but WITHOUT ANY WARRANTY; without even the implied warranty of
 -- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 -- GNU General Public License for more details.
@@ -24,16 +24,16 @@ description = [[
 Search for probable vulnerabilities based on services discovered in open ports.
 CVEs information gathered from nvd.nist.gov.
 ]]
---- Prerequisite: cve.db. Can be generated using database.py or obtained from https://github.com/scmanjarrez/CVEScannerV2DB
+--- Prerequisite: cve.db. Can be generated using database.py or obtained from https://github.com/scmanjarrez/CVEScannerV3DB
 --
---- Run: Execute CVEscannerV2
--- @usage nmap -sV --script cvescannerv2 <target-ip>
--- @usage nmap -sV --script cvescannerv2 --script-args log=logfile.log,json=logfile.json <target-ip>
+--- Run: Execute CVEscannerV3
+-- @usage nmap -sV --script cvescannerv3 <target-ip>
+-- @usage nmap -sV --script cvescannerv3 --script-args log=logfile.log,json=logfile.json <target-ip>
 --
 -- @output
 -- PORT      STATE SERVICE       VERSION
 -- 3306/tcp  open  mysql         MySQL 5.5.55
--- | cvescannerv2:
+-- | cvescannerv3:
 -- |   source: nvd.nist.gov
 -- |   product: mysql
 -- |   version: 5.5.55
@@ -51,8 +51,8 @@ CVEs information gathered from nvd.nist.gov.
 -- maxcve: Limit the number of CVEs printed on screen. Default: 10
 -- http: Modify HTTP analysis behaviour. Default: 1 (enabled). Possible values: 0, 1
 -- maxredirect: Limit the number of redirections. Default: 1
--- log: Modify the output .log file location. Default: cvescannerv2.log
--- json: Modify the output .json file location. Default: cvescannerv2.json
+-- log: Modify the output .log file location. Default: cvescannerv3.log
+-- json: Modify the output .json file location. Default: cvescannerv3.json
 -- path: Modify the paths file location. Default: extra/http-paths-vulnerscom.json
 -- regex: Modify the regex file location. Default: extra/http-regex-vulnerscom.json
 -- aliases: Modify the product-aliases file location. Default: extra/product-aliases.json
@@ -62,7 +62,7 @@ CVEs information gathered from nvd.nist.gov.
 
 categories = {"safe"}
 author = "Sergio Chica"
-version = "3.3"
+version = "3.4"
 
 local http = require 'http'
 http.USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64; rv:108.0) Gecko/20100101 Firefox/108.0'
@@ -77,8 +77,8 @@ local db_arg = stdnse.get_script_args('db') or 'cve.db'
 local maxcve_arg = tonumber(stdnse.get_script_args('maxcve')) or 10
 local http_arg = stdnse.get_script_args('http') or '1'
 local maxredirect_arg = tonumber(stdnse.get_script_args('maxredirect')) or 1
-local log_arg = stdnse.get_script_args('log') or 'cvescannerv2.log'
-local json_arg = stdnse.get_script_args('json') or 'cvescannerv2.json'
+local log_arg = stdnse.get_script_args('log') or 'cvescannerv3.log'
+local json_arg = stdnse.get_script_args('json') or 'cvescannerv3.json'
 -- local word_arg = stdnse.get_script_args('word') or nil
 -- local ext_arg = stdnse.get_script_args('ext') or nil
 local path_arg = stdnse.get_script_args('path') or 'extra/http-paths-vulnerscom.json'
@@ -108,6 +108,12 @@ local registry = nmap.registry[SCRIPT_NAME]
 
 local function empty (str)
    return str == nil or str == ''
+end
+
+
+local function sql_escape (str)
+   if str == nil then return 'NULL' end
+   return str:gsub("'", "''")
 end
 
 
@@ -180,6 +186,9 @@ end
 
 local function valid_json (arg, ftype)
    local f = io.open(arg, 'r')
+   if f == nil then
+      return false
+   end
    local status, data = json.parse(f:read('*all'))
    if status then
       if ftype == 'path' then
@@ -234,11 +243,17 @@ local function add_cpe_version(cpe, version, matches, location)
 end
 
 
-local function add_cpe_aliases(cpe, version, matches, location)
+local function parse_cpe_parts(cpe)
    local parts = {}
    for part in string.gmatch(cpe, "([^:]+)") do
       table.insert(parts, part)
    end
+   return parts
+end
+
+
+local function add_cpe_aliases(cpe, version, matches, location)
+   local parts = parse_cpe_parts(cpe)
    local product = parts[4]
    -- Product aliases
    if registry.aliases[product] then
@@ -296,23 +311,32 @@ local function redirect(_, _)
 end
 
 local function http_match (host, port, matches)
+   local consecutive_errors = 0
+   local max_errors = 3
    for _, path in pairs(registry.path['path']) do
       for _, ext in pairs(registry.path['extension']) do
          local file = "/" .. path .. ext
          if (path == '' and ext == '') or path ~= '' then
+            if consecutive_errors >= max_errors then
+               stdnse.verbose(2, fmt("Skipping http://%s:%s%s: %d consecutive errors",
+                                     host.ip, port.number, file, consecutive_errors))
+               break
+            end
             local resp = http.get(host, port, file,
                                   {
                                      redirect_ok = redirect,
-                                     timeout = 90,
+                                     timeout = 15000,
                                      bypass_cache = true,
                                      no_cache = true,
                                      no_cache_body = true
                                   }
             )
             if not resp.status then
+               consecutive_errors = consecutive_errors + 1
                stdnse.verbose(2, fmt("Error processing request http://%s:%s%s => %s",
                                      host.ip, port.number, file, resp['status-line']))
             else
+               consecutive_errors = 0
                if #resp.rawheader > 0 then
                   for _, header in pairs(resp.rawheader) do
                      regex_match(header, 'header', matches)
@@ -333,7 +357,7 @@ local function http_match (host, port, matches)
                      local lib_resp = http.get(host, port, lib_path,
                                                {
                                                   redirect_ok = redirect,
-                                                  timeout = 90,
+                                                  timeout = 15000,
                                                   bypass_cache = true,
                                                   no_cache = true,
                                                   no_cache_body = true
@@ -372,7 +396,7 @@ local function http_match (host, port, matches)
                   for name, data in pairs(registry.regex['body']) do
                      for k, v in pairs(libs) do
                         if k ~= 'size' then
-                           local k_stripped = (k:gsub('.js', '')):lower()
+                           local k_stripped = (k:gsub('%.js', '')):lower()
                            if (name:lower()):find(k_stripped) then
                               add_cpe_version(data['cpe'], v, matches, 'http')
                            end
@@ -382,6 +406,11 @@ local function http_match (host, port, matches)
                end
             end
          end
+      end
+      if consecutive_errors >= max_errors then
+         stdnse.verbose(1, fmt("Aborting HTTP scan for %s:%s after %d consecutive errors",
+                               host.ip, port.number, consecutive_errors))
+         break
       end
    end
 end
@@ -502,11 +531,14 @@ end
 local function dump_exploit (host, port, vuln)
    local _ip = host.ip
    local _port = fmt('%s/%s', port.number, port.protocol)
+   local cur_score, cur_exp, cur_msf
+
    -- Dump the CVE score
-   local cur = registry.conn:execute(
-      fmt(query('cve_score'), vuln)
+   cur_score = registry.conn:execute(
+      fmt(query('cve_score'), sql_escape(vuln))
    )
-   local cvssv2, cvssv3 = cur:fetch()
+   local cvssv2, cvssv3 = cur_score:fetch()
+   cur_score:close()
    log("[-] \tid: %-18s\tcvss_v2: %-5s\tcvss_v3: %-5s", vuln, cvssv2, cvssv3 or "-")
    local t_serv = #registry.json_out[_ip]['ports'][_port]['services']
    registry.json_out[_ip]['ports'][_port]['services'][t_serv]['vulnerabilities']['cves'][vuln] = {
@@ -515,10 +547,10 @@ local function dump_exploit (host, port, vuln)
    }
 
    -- Dump exploits from Exploit-DB
-   cur = registry.conn:execute(
-      fmt(query('exploit_info'), vuln)
+   cur_exp = registry.conn:execute(
+      fmt(query('exploit_info'), sql_escape(vuln))
    )
-   local exploit, name = cur:fetch()
+   local exploit, name = cur_exp:fetch()
    if exploit then
       log("[!] \t\tExploitDB:")
       registry.json_out[_ip]['ports'][_port]['services'][t_serv]['vulnerabilities']['cves'][vuln]['exploitdb'] = {}
@@ -532,15 +564,16 @@ local function dump_exploit (host, port, vuln)
             ['id'] = exploit,
             ['url'] = fmt('https://www.exploit-db.com/exploits/%s', exploit)
          }
-         exploit, name = cur:fetch()
+         exploit, name = cur_exp:fetch()
       end
    end
+   cur_exp:close()
 
    -- Dump exploits from Metasploit
-   cur = registry.conn:execute(
-      fmt(query('metasploit_info'), vuln)
+   cur_msf = registry.conn:execute(
+      fmt(query('metasploit_info'), sql_escape(vuln))
    )
-   name = cur:fetch()
+   name = cur_msf:fetch()
    if name then
       log("[!] \t\tMetasploit:")
       registry.json_out[_ip]['ports'][_port]['services'][t_serv]['vulnerabilities']['cves'][vuln]['metasploit'] = {}
@@ -548,9 +581,10 @@ local function dump_exploit (host, port, vuln)
       while name do
          log("[#] \t\t\tname: %s", name)
          meta_list[#meta_list + 1] = {['name'] = name}
-         name = cur:fetch()
+         name = cur_msf:fetch()
       end
    end
+   cur_msf:close()
 end
 
 
@@ -704,8 +738,8 @@ end
 
 
 local function vulnerabilities (host, port, cpe, product, info)
-   local qrym = fmtn(query('multiaffected'), {p = product})
-   local qry = fmtn(query('affected'), {p = product})
+   local qrym = fmtn(query('multiaffected'), {p = sql_escape(product)})
+   local qry = fmtn(query('affected'), {p = sql_escape(product)})
    local from = info.ver
    local to = info.ver
    local upd = info.vup
@@ -718,31 +752,57 @@ local function vulnerabilities (host, port, cpe, product, info)
    else
       -- Given that we assumed '*' as version and vupdate when empty,
       -- we can't search vulnerabilities for specific versions
-      qrym = fmtn(query('multiaffected_empty'), {p = product})
+      qrym = fmtn(query('multiaffected_empty'), {p = sql_escape(product)})
    end
 
    -- Search vulnerabilities affecting multiple versions (this one included)
    local cur = registry.conn:execute(qrym)
-   local vuln, cvssv2, cvssv3, st_in, st_ex, en_in, en_ex, exploitdb, metasploit = cur:fetch()
    local tmp_vulns = {}
    local idx = 1
-   while vuln do
-      tmp_vulns[idx] = {
-         id = vuln,
-         CVSSV2 = cvssv2, CVSSV3 = cvssv3,
-         StartInc = st_in, StartExc = st_ex,
-         EndInc = en_in, EndExc = en_ex,
-         ExploitDB = exploitdb,
-         Metasploit = metasploit
-      }
-      idx = idx + 1
-      vuln, cvssv2, cvssv3, st_in, st_ex, en_in, en_ex, exploitdb, metasploit = cur:fetch()
-   end
-
    local vulns = {}
-   scoped_multi_versions(tmp_vulns, from, to, vulns)
 
-   if not info.empty then
+   if info.empty then
+      -- multiaffected_empty returns 5 columns: cve_id, cvss_v2, cvss_v3, edb, msf
+      local vuln, cvssv2, cvssv3, exploitdb, metasploit = cur:fetch()
+      while vuln do
+         tmp_vulns[idx] = {
+            id = vuln,
+            CVSSV2 = cvssv2, CVSSV3 = cvssv3,
+            StartInc = nil, StartExc = nil,
+            EndInc = nil, EndExc = nil,
+            ExploitDB = exploitdb,
+            Metasploit = metasploit
+         }
+         idx = idx + 1
+         vuln, cvssv2, cvssv3, exploitdb, metasploit = cur:fetch()
+      end
+      -- For empty version info, all multiaffected_empty results apply directly
+      for _, v in pairs(tmp_vulns) do
+         if vulns[v.id] == nil then
+            vulns[v.id] = {
+               ['CVSSV2'] = v.CVSSV2, ['CVSSV3'] = v.CVSSV3,
+               ['ExploitDB'] = v.ExploitDB,
+               ['Metasploit'] = v.Metasploit
+            }
+         end
+      end
+   else
+      -- multiaffected returns 9 columns: cve_id, cvss_v2, cvss_v3, st_in, st_ex, en_in, en_ex, edb, msf
+      local vuln, cvssv2, cvssv3, st_in, st_ex, en_in, en_ex, exploitdb, metasploit = cur:fetch()
+      while vuln do
+         tmp_vulns[idx] = {
+            id = vuln,
+            CVSSV2 = cvssv2, CVSSV3 = cvssv3,
+            StartInc = st_in, StartExc = st_ex,
+            EndInc = en_in, EndExc = en_ex,
+            ExploitDB = exploitdb,
+            Metasploit = metasploit
+         }
+         idx = idx + 1
+         vuln, cvssv2, cvssv3, st_in, st_ex, en_in, en_ex, exploitdb, metasploit = cur:fetch()
+      end
+      scoped_multi_versions(tmp_vulns, from, to, vulns)
+
       tmp_vulns = {}
       -- Search vulnerabilities affecting specific version
       cur = registry.conn:execute(qry)
@@ -760,9 +820,8 @@ local function vulnerabilities (host, port, cpe, product, info)
          idx = idx + 1
          vuln, cvssv2, cvssv3, pr_v, pr_vu, exploitdb, metasploit = cur:fetch()
       end
+      scoped_versions(tmp_vulns, from, to, upd, vulns)
    end
-
-   scoped_versions(tmp_vulns, from, to, upd, vulns)
 
    -- Sort CVEs by CVSSv3 and CVSSv2
    local sorted = {}
@@ -843,7 +902,8 @@ local function analysis (host, port, matches)
                   log_info(host, port, cpe, product, info)
                   local v, vu = correct_version(info)
                   local tmp_vulns = nil
-                  if not registry.cache[fmt('%s|%s|%s', product, v, vu)] then
+                  local cache_key = fmt('%s|%s|%s', product, v, vu)
+                  if not registry.cache[cache_key] then
                      tmp_vulns = vulnerabilities(host, port, cpe, product, info)
                      local nvulns = table.remove(tmp_vulns, 1)
                      if nvulns > 0 then
@@ -862,11 +922,11 @@ local function analysis (host, port, matches)
                         )
                         stdnse.verbose(2, "Caching " .. product .. "|" ..
                            v .. "|" .. vu .. " vulnerabilities.")
-                        registry.cache[fmt('%s|%s|%s', product, v, vu)] = { nvulns, tmp_vulns }
                      end
+                     registry.cache[cache_key] = { nvulns, tmp_vulns }
                   else
                      log("[+] cves: cached")
-                     local cache = registry.cache[fmt('%s|%s|%s', product, v, vu)]
+                     local cache = registry.cache[cache_key]
                      if cache[1] > 0 then
                         local port_proto = fmt('%s/%s', port.number, port.protocol)
                         if registry.json_out[host.ip]['ports'][port_proto] == nil then
@@ -892,9 +952,10 @@ local function analysis (host, port, matches)
                         v .. "|" .. vu .. " vulnerabilities.")
                      tmp_vulns = cache[2]
                   end
+                  local logged_key = fmt("%s|%s", product, version)
                   if (tmp_vulns ~= nil and #tmp_vulns > 0
-                      and logged[fmt("%s|%s", product, version)] == nil) then
-                     logged[fmt("%s|%s", product, version)] = 1
+                      and logged[logged_key] == nil) then
+                     logged[logged_key] = 1
                      for _, value in pairs(tmp_vulns) do
                         table.insert(vulns, value)
                      end
@@ -980,6 +1041,9 @@ portaction = function (host, port)
    local vulns
    if matches['size'] ~= 0 then
       vulns = analysis(host, port, matches)
+   end
+   if vulns == nil or #vulns == 0 then
+      return nil
    end
    return vulns
 end

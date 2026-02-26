@@ -14,7 +14,7 @@ jobs:
           fetch-depth: 0
       - name: Push
         run: |
-          git remote add gast https://gitlab.gast.it.uc3m.es/schica/CVEScannerV2
+          git remote add gast https://gitlab.gast.it.uc3m.es/schica/CVEScannerV3
           cat << EOF > /usr/local/bin/credential-helper
           #!/bin/bash
           cat /tmp/gitlab
