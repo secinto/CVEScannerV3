@@ -44,7 +44,7 @@ The current implementation take care of the following cases:
 > Nmap library shortport is used to detect if port matches HTTP/SSL.
 
 # Requirements
-In order to run **cvescannerv2** script, you need the following files present
+In order to run **cvescannerv3** script, you need the following files present
 in your working directory
 - CVE database: `cve.db`
 - Paths file: `extra/http-paths-vulnerscom.json`
@@ -57,7 +57,7 @@ or `lua5.4-sql-sqlite3` (alpine) packages
 ## Optional
 If you don't have the database `cve.db`, you can build it
 using the script `extra/database.py` or download a (semiupdated) copy
-from [CVEScannerV2DB](https://github.com/scmanjarrez/CVEScannerV2DB) using `.sql` files
+from [CVEScannerV3DB](https://github.com/scmanjarrez/CVEScannerV3DB) using `.sql` files
 or under Actions->Latest->Summary->Artifacts
 
 > This repository is updated every two weeks
@@ -68,8 +68,8 @@ python extra/database.py
 ```
 
 ```bash
-git clone https://github.com/scmanjarrez/CVEScannerV2DB
-cd CVEScannerV2DB && sh build.sh
+git clone https://github.com/scmanjarrez/CVEScannerV3DB
+cd CVEScannerV3DB && sh build.sh
 ```
 
 > **Note:** In order to execute `extra/database.py`, you need to
@@ -80,8 +80,8 @@ cd CVEScannerV2DB && sh build.sh
 # Execution
 To run the script, use the following syntax
 ```
-nmap -sV --script cvescannerv2 <TARGET>
-nmap -sV --script cvescannerv2 --script-args log=logfile.log,json=logfile.json <TARGET>
+nmap -sV --script cvescannerv3 <TARGET>
+nmap -sV --script cvescannerv3 --script-args log=logfile.log,json=logfile.json <TARGET>
 ```
 
 It is possible to modify the behaviour to some extent using the
@@ -94,8 +94,8 @@ path, regex, aliases, service and version.
     maxcve: 10
     http: 1
     maxredirect: 1
-    log: cvescannerv2.log
-    json: cvescannerv2.json
+    log: cvescannerv3.log
+    json: cvescannerv3.json
     path: extra/http-paths-vulnerscom.json
     regex: extra/http-regex-vulnerscom.json
     aliases: extra/product-aliases.json
@@ -106,20 +106,20 @@ path, regex, aliases, service and version.
 <details>
     <summary><b>script-args examples</b></summary>
 
-    nmap -sV --script cvescannerv2 --script-args db=cve.db <TARGET>
-    nmap -sV --script cvescannerv2 --script-args maxcve=5 <TARGET>
+    nmap -sV --script cvescannerv3 --script-args db=cve.db <TARGET>
+    nmap -sV --script cvescannerv3 --script-args maxcve=5 <TARGET>
 
     # Change reports path
-    nmap -sV --script cvescannerv2 --script-args log=scan2023.log,json=scan2023.json <TARGET>
+    nmap -sV --script cvescannerv3 --script-args log=scan2023.log,json=scan2023.json <TARGET>
 
     # Only scan certain service/version
-    nmap -sV --script cvescannerv2 --script-args service=http_server,version=2.4.57 <TARGET>
+    nmap -sV --script cvescannerv3 --script-args service=http_server,version=2.4.57 <TARGET>
 
     # Disable HTTP detection
-    nmap -sV --script cvescannerv2 --script-args http=0 <TARGET>
+    nmap -sV --script cvescannerv3 --script-args http=0 <TARGET>
 </details>
 
-> **Note**: `cvescannerv2.nse` can be placed in Nmap default script directory
+> **Note**: `cvescannerv3.nse` can be placed in Nmap default script directory
 > for global execution.
 >
 > - Linux and OSX default script locations:
@@ -136,16 +136,16 @@ path, regex, aliases, service and version.
 > in the script.
 
 ## Output
-CVEScannerV2 will show CVEs related to every `service-version` discovered.
+CVEScannerV3 will show CVEs related to every `service-version` discovered.
 > **Note**: This script depends on heuristics implemented in Nmap, so if it doesn't
-> detect a service or is detected incorrectly, CVEScannerV2 will show an incorrect output.
+> detect a service or is detected incorrectly, CVEScannerV3 will show an incorrect output.
 
 <details>
     <summary><b>Nmap output</b></summary>
 
     PORT      STATE    SERVICE        VERSION
     22/tcp    open  ssh                  OpenSSH 7.1 (protocol 2.0)
-    | cvescannerv2:
+    | cvescannerv3:
     |   product: openssh
     |   version: 4.7
     |   vupdate: p1
@@ -159,7 +159,7 @@ CVEScannerV2 will show CVEs related to every `service-version` discovered.
     ...
     ...
     3306/tcp  open  mysql                MySQL 5.5.20-log
-    | cvescannerv2:
+    | cvescannerv3:
     |   product: mysql
     |   version: 5.0.51
     |   vupdate: a
@@ -177,7 +177,7 @@ CVEScannerV2 will show CVEs related to every `service-version` discovered.
 Log file **\*.log** contains every _exploit/metasploit_ found.
 
 <details>
-    <summary><b>cvescannerv2.log</b></summary>
+    <summary><b>cvescannerv3.log</b></summary>
 
     ## 2023-08-26T14:38:30+00:00
 
@@ -225,7 +225,7 @@ Log file **\*.log** contains every _exploit/metasploit_ found.
 Log file **\*.json** contains the same information but formatted as **json**
 
 <details>
-    <summary><b>cvescannerv2.json</b></summary>
+    <summary><b>cvescannerv3.json</b></summary>
 
     {
       "192.168.69.129": {
@@ -287,7 +287,7 @@ Log file **\*.json** contains the same information but formatted as **json**
 **Fix:** Wait 15 minutes before re-running `database.py`.
 
 ## Missing luasql
-> cvescannerv2.nse:54: module 'luasql.sqlite3' not found:<br>
+> cvescannerv3.nse:54: module 'luasql.sqlite3' not found:<br>
 > NSE failed to find nselib/luasql/sqlite3.lua in search paths.<br>
 > ...
 
@@ -308,12 +308,12 @@ ln -s /usr/lib/lua /usr/local/lib/lua
 We have prepared two containers configured and ready to be used, you can download them
 from DockerHub
 - Database embedded version: `scmanjarrez/cvescanner:db` or `scmanjarrez/cvescanner:latest`
-- No database: `scmanjarrez/cvescannerv2:nodb`
+- No database: `scmanjarrez/cvescannerv3:nodb`
 
 ```bash
 docker run -v /tmp/cvslogs:/tmp/cvslogs scmanjarrez/cvescanner --script-args log=/tmp/cvslogs/scan.log,json=/tmp/cvslogs/scan.json <TARGET>
 
-docker run -v ./cve.db:/CVEScannerV2/cve.db -v /tmp/cvslogs:/tmp/cvslogs scmanjarrez/cvescanner:nodb --script-args log=/tmp/cvslogs/cvescannerv2.log,json=/tmp/cvslogs/cvescannerv2.json <TARGET>
+docker run -v ./cve.db:/CVEScannerV3/cve.db -v /tmp/cvslogs:/tmp/cvslogs scmanjarrez/cvescanner:nodb --script-args log=/tmp/cvslogs/cvescannerv3.log,json=/tmp/cvslogs/cvescannerv3.json <TARGET>
 ```
 
 > **Note**: You can find your logs in `/tmp/cvslogs` directory
@@ -383,7 +383,7 @@ Structural Funds (ESF and FEDER)**
 - CVE information gathered from [nvd.nist.gov](https://nvd.nist.gov).
 
 # License
-    CVEScannerV2  Copyright (C) 2021-2025 Sergio Chica Manjarrez @ pervasive.it.uc3m.es.
+    CVEScannerV3  Copyright (C) 2021-2025 Sergio Chica Manjarrez @ pervasive.it.uc3m.es.
     Universidad Carlos III de Madrid.
     This program comes with ABSOLUTELY NO WARRANTY; for details check below.
     This is free software, and you are welcome to redistribute it

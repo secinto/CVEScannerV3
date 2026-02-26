@@ -8,7 +8,7 @@ Comprehensive analysis of security issues, bugs, and performance improvements.
 
 ### SEC-1: SQL Injection via String Formatting in NSE Script (CRITICAL)
 
-**File:** `cvescannerv2.nse:442-498, 506-542`
+**File:** `cvescannerv3.nse:442-498, 506-542`
 
 The `query()` function builds SQL templates with `'${p}'` placeholders for product names, and `'%s'` for CVE IDs. These are substituted via `fmtn()` and `fmt()` with no sanitization or parameterized queries.
 
@@ -30,7 +30,7 @@ Product names come from CPE strings (parsed from Nmap service detection and HTTP
 
 ### SEC-2: File Handle Leak / Nil Dereference in `valid_json()` (HIGH)
 
-**File:** `cvescannerv2.nse:181-195`
+**File:** `cvescannerv3.nse:181-195`
 
 ```lua
 local function valid_json (arg, ftype)
@@ -140,7 +140,7 @@ The workflow creates a credential helper script at `/usr/local/bin/credential-he
 
 ### BUG-1: Column Mismatch in `multiaffected_empty` Query Unpacking (HIGH)
 
-**File:** `cvescannerv2.nse:475-486, 725-740`
+**File:** `cvescannerv3.nse:475-486, 725-740`
 
 The `multiaffected_empty` query returns **5 columns**: `cve_id, cvss_v2, cvss_v3, edb, msf`. However, the code unpacks **9 variables**:
 
@@ -171,7 +171,7 @@ vuln, cvssv2, cvssv3, exploitdb, metasploit = cur:fetch()
 
 ### BUG-2: Unescaped Dot in `gsub` Pattern (MEDIUM)
 
-**File:** `cvescannerv2.nse:375`
+**File:** `cvescannerv3.nse:375`
 
 ```lua
 local k_stripped = (k:gsub('.js', '')):lower()
@@ -187,7 +187,7 @@ local k_stripped = (k:gsub('%.js', '')):lower()
 
 ### BUG-3: `scoped_versions()` Called with Multiaffected Data When `info.empty` (MEDIUM)
 
-**File:** `cvescannerv2.nse:745-765`
+**File:** `cvescannerv3.nse:745-765`
 
 When `info.empty` is true, the code skips re-initializing `tmp_vulns` for the affected query (lines 745-763), so `tmp_vulns` still contains data from the multiaffected query. Then `scoped_versions(tmp_vulns, from, to, upd, vulns)` is called on line 765 with `from = '*'` and `to = '*'`.
 
@@ -199,7 +199,7 @@ Inside `scoped_versions`, `compare_version()` is called with `'*'` as an argumen
 
 ### BUG-4: `portaction` Returns Empty Table Instead of `nil` for 0-CVE Products (HIGH)
 
-**File:** `cvescannerv2.nse:908, 980-984`
+**File:** `cvescannerv3.nse:908, 980-984`
 
 **Observed on:** Host 195.201.149.167, nginx 1.26.3 on ports 80, 443, and 2100.
 
@@ -242,7 +242,7 @@ return vulns
 
 ### BUG-5: Zero-CVE Results Not Cached, Causing Redundant Queries (MEDIUM)
 
-**File:** `cvescannerv2.nse:846-866`
+**File:** `cvescannerv3.nse:846-866`
 
 **Observed on:** Host 195.201.149.167, nginx 1.26.3 on ports 80, 443, and 2100.
 
@@ -320,7 +320,7 @@ If `sql.OperationalError` occurs persistently (e.g., corrupted database), this l
 
 ### BUG-8: Database Cursors Not Closed on Error (LOW)
 
-**File:** `cvescannerv2.nse:506-553`
+**File:** `cvescannerv3.nse:506-553`
 
 In `dump_exploit()`, three cursors are opened (lines 506, 518, 542) but none have error handling. If any operation between cursor creation and the function end throws an error, the cursors leak. Only the last cursor opened in `vulnerabilities()` is explicitly closed on line 822.
 
@@ -341,7 +341,7 @@ desc="[+] Retrieving metastploit data"
 
 ### PERF-1: HTTP Path Brute-Force is O(paths x extensions) Sequential Requests (HIGH)
 
-**File:** `cvescannerv2.nse:298-387`
+**File:** `cvescannerv3.nse:298-387`
 
 The `http_match()` function iterates over all combinations of paths (12) and extensions (17) = **204 HTTP requests per port**, all made sequentially. Each request has a 90-second timeout.
 
@@ -357,7 +357,7 @@ The `http_match()` function iterates over all combinations of paths (12) and ext
 
 ### PERF-2: Individual SQL Queries Per CVE in `dump_exploit()` (HIGH)
 
-**File:** `cvescannerv2.nse:502-553`
+**File:** `cvescannerv3.nse:502-553`
 
 For every CVE found, `dump_exploit()` executes **3 separate SQL queries** (score, exploit-db, metasploit). For a product with 500 CVEs, that's 1,500 individual queries.
 
@@ -416,7 +416,7 @@ while True:
 
 ### PERF-5: CPE String Re-Parsed Multiple Times (MEDIUM)
 
-**File:** `cvescannerv2.nse:238-250, 427-438`
+**File:** `cvescannerv3.nse:238-250, 427-438`
 
 `add_cpe_aliases()` re-parses the CPE string using `string.gmatch()` on every call, even though the same CPE was already parsed (or will be parsed) in `cpe_parser()`.
 
@@ -426,7 +426,7 @@ while True:
 
 ### PERF-6: Redundant String Format Operations in Hot Loops (LOW)
 
-**File:** `cvescannerv2.nse:846, 865, 869, 896`
+**File:** `cvescannerv3.nse:846, 865, 869, 896`
 
 The cache key `fmt('%s|%s|%s', product, v, vu)` is computed 4+ times in `analysis()` for the same product/version/vupdate combination.
 
