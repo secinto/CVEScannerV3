@@ -27,6 +27,7 @@ import html
 import os
 import re
 import sqlite3 as sql
+import sys
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -85,6 +86,13 @@ CONST = {
     "cve": 2000,
     "bat": 25,
 }
+
+
+class DatabaseUpdateError(Exception):
+    """Raised when the database update process fails."""
+    pass
+
+
 COPYRIGHT = """
 CVEScannerV3  Copyright (C) 2022-2025 Sergio Chica Manjarrez @ pervasive.it.uc3m.es.
 Universidad Carlos III de Madrid.
@@ -412,9 +420,11 @@ class PopulateDBThread(Thread):
                                 self.datalist[dt] = []
                         elif self.finished.is_set():
                             break
-            except Exception:
+            except Exception as exc:
                 print(traceback.format_exc())
-                os._exit(1)
+                raise DatabaseUpdateError(
+                    "Database population thread failed"
+                ) from exc
 
 
 @LIMITER.ratelimit("identity", delay=True)
@@ -429,9 +439,11 @@ def query_api(args):
             return
         try:
             data = resp.json()
-        except Exception:
+        except Exception as exc:
             print(traceback.format_exc())
-            os._exit(1)
+            raise DatabaseUpdateError(
+                "Failed to parse NVD API response"
+            ) from exc
         if "cpes" in url:
             idy = 0
             for prod in data["products"]:
@@ -546,25 +558,27 @@ def update_db(args, thread_objs, populate=False):
             timeout=120, headers=api_headers,
         )
     except httpx.HTTPError as e:
-        print(e)
-        os._exit(1)
+        raise DatabaseUpdateError(f"HTTP error retrieving CPE metadata: {e}") from e
     if resp.status_code != 200:
-        print(f"[!] Error retrieving information from NVD API: {resp.text}")
-        os._exit(-1)
+        raise DatabaseUpdateError(
+            f"Error retrieving information from NVD API: {resp.text}"
+        )
     try:
         cpes = resp.json()["totalResults"]
-    except Exception:
-        print(traceback.format_exc())
-        os._exit(1)
+    except Exception as e:
+        raise DatabaseUpdateError(
+            f"Failed to parse CPE metadata response: {e}"
+        ) from e
     resp = httpx.get(
         f"{URL['nvd'].format('cves', 0)}&resultsPerPage=1{extra}",
         timeout=120, headers=api_headers,
     )
     try:
         cves = resp.json()["totalResults"]
-    except Exception:
-        print(traceback.format_exc())
-        os._exit(1)
+    except Exception as e:
+        raise DatabaseUpdateError(
+            f"Failed to parse CVE metadata response: {e}"
+        ) from e
     print(f"[+] Metadata: {cpes} CPEs | {cves} CVEs")
     cve_q, cpe_q = -(-cves // CONST["cve"]), -(-cpes // CONST["cpe"])
     cve_l = cves % CONST["cve"] or CONST["cve"]
@@ -618,13 +632,15 @@ def update_metasploit(args, thread_objs):
     try:
         page = httpx.get(URL["msfdb"], timeout=120)
     except httpx.HTTPError as e:
-        print(e)
-        os._exit(1)
+        raise DatabaseUpdateError(
+            f"HTTP error retrieving Metasploit data: {e}"
+        ) from e
     try:
         cache = page.json()
-    except Exception:
-        print(traceback.format_exc())
-        os._exit(1)
+    except Exception as e:
+        raise DatabaseUpdateError(
+            f"Failed to parse Metasploit response: {e}"
+        ) from e
     with Database(args.database) as db:
         for vuln in tqdm(
             cache, ascii=" =", desc="[+] Retrieving metasploit data"
@@ -663,8 +679,9 @@ def scrape_title(exploit):
         if match:
             title = match.group(3)  # group 1 and 2 are quotes
     except httpx.HTTPError as e:
-        print(e)
-        os._exit(1)
+        raise DatabaseUpdateError(
+            f"HTTP error scraping ExploitDB {exploit}: {e}"
+        ) from e
     finally:
         time.sleep(delay)
     return title, exploit
@@ -696,6 +713,54 @@ def update_exploitdb(args):
                             bar.update()
 
 
+def run_update(database, api_key, noscrape=False, full=False):
+    """Run the database create/update process.
+
+    Args:
+        database: Path to the database file.
+        api_key: NVD API key string.
+        noscrape: If True, skip ExploitDB name scraping.
+        full: If True, force full rebuild (delete existing DB first).
+
+    Raises:
+        DatabaseUpdateError: On any failure during the update process.
+    """
+    global KEY
+    KEY = api_key
+
+    database = Path(database)
+    if full and database.is_file():
+        database.unlink()
+
+    # Create an args-like object for backward compatibility with
+    # update_db/update_metasploit/update_exploitdb functions
+    class _Args:
+        pass
+    args = _Args()
+    args.database = database
+    args.noscrape = noscrape
+
+    print(COPYRIGHT)
+
+    thread_objs = (Event(), Event(), Queue())
+    thread = PopulateDBThread(database, *thread_objs)
+    thread.start()
+
+    try:
+        update_db(args, thread_objs, populate=not database.is_file())
+
+        with Database(database) as db:
+            db.update_metadata()
+
+        update_metasploit(args, thread_objs)
+        update_exploitdb(args)
+    finally:
+        with tqdm(total=1, ascii=" =", desc="[*] Awaiting database thread") as bar:
+            thread_objs[0].set()
+            thread.join()
+            bar.update()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Tool to generate/update CVEScannerV3 database"
@@ -711,34 +776,25 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    print(COPYRIGHT)
-
     api = Path(".api")
     if api.is_file():
         with api.open() as f:
-            KEY = f.read().strip()
+            api_key = f.read().strip()
     else:
-        KEY = os.getenv("NVD_KEY")
-        if KEY is None:
+        api_key = os.getenv("NVD_KEY")
+        if api_key is None:
             print(
                 "[!] NVD API key required in order to retrieve data. "
                 "Check README.md for more information"
             )
-            os._exit(-1)
+            sys.exit(1)
 
-    thread_objs = (Event(), Event(), Queue())
-    thread = PopulateDBThread(args.database, *thread_objs)
-    thread.start()
-
-    update_db(args, thread_objs, populate=not args.database.is_file())
-
-    with Database(args.database) as db:
-        db.update_metadata()
-
-    update_metasploit(args, thread_objs)
-    update_exploitdb(args)
-
-    with tqdm(total=1, ascii=" =", desc="[*] Awaiting database thread") as bar:
-        thread_objs[0].set()
-        thread.join()
-        bar.update()
+    try:
+        run_update(
+            database=args.database,
+            api_key=api_key,
+            noscrape=args.noscrape,
+        )
+    except DatabaseUpdateError as e:
+        print(f"[!] {e}")
+        sys.exit(1)
