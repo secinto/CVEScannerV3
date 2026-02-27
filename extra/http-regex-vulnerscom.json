@@ -26,6 +26,10 @@
                 "X%-AspNetMvc%-Version:%s*(%d[%d.]+)"
             ]
         },
+        "Caddy": {
+            "cpe": "cpe:/a:caddyserver:caddy",
+            "regex": "Server:%s*Caddy[/%s]*(%d[%d.]+)"
+        },
         "Chamilo LMS": {
             "cpe": "cpe:/a:chamilo:chamilo_lms",
             "regex": "X%-Powered%-By:%s*Chamilo%s*(%d[%d.]+)"
@@ -77,6 +81,10 @@
             "cpe": "cpe:/a:directadmin:directadmin",
             "regex": "Server:%s*DirectAdmin%s*Daemon%s*v?(%d[%d.]+)"
         },
+        "Express": {
+            "cpe": "cpe:/a:expressjs:express",
+            "regex": "X%-Powered%-By:%s*Express"
+        },
         "Flash Communication Server": {
             "cpe": "cpe:/a:macromedia:flash_communication_server",
             "regex": "Server:%s*FlashCom[/%s]*(%d[%d.]+)"
@@ -93,6 +101,10 @@
                 "Server:%s*GlassFish%s*Server[/%s]*(%d[%d.]+)",
                 "Server:%s*GlassFish%s*Server%s*Open%s*Source%s*Edition[/%s]*(%d[%d.]+)"
             ]
+        },
+        "Gunicorn": {
+            "cpe": "cpe:/a:gunicorn:gunicorn",
+            "regex": "Server:%s*gunicorn[/%s]*(%d[%d.]+)"
         },
         "GXV Device Firmware": {
             "cpe": "cpe:/o:grandstream:gxv_device_firmware",
@@ -137,6 +149,10 @@
                 "Server:%s*Winstone%s*Servlet%s*Container%s*v?(%d[%d.]+)",
                 "Server:%s*Winstone%s*Servlet%s*Engine%s*v?(%d[%d.]+)"
             ]
+        },
+        "Kestrel": {
+            "cpe": "cpe:/a:microsoft:kestrel",
+            "regex": "Server:%s*Kestrel"
         },
         "Kibana": {
             "cpe": "cpe:/a:elasticsearch:kibana",
@@ -214,12 +230,20 @@
             "cpe": "cpe:/a:monkey-project:monkey_http_daemon",
             "regex": "Server:%s*Monkey[/%s]*(%d[%d.]+)"
         },
+        "Next.js": {
+            "cpe": "cpe:/a:vercel:next.js",
+            "regex": "X%-Powered%-By:%s*Next%.js%s*(%d[%d.]*)"
+        },
         "Nginx": {
             "cpe": "cpe:/a:nginx:nginx",
             "regex": [
                 "Server:%s*nginx[/%s]*(%d[%d.]+)",
                 "Server:%s*nginx%-reuseport[/%s]*(%d[%d.]+)"
             ]
+        },
+        "Openresty": {
+            "cpe": "cpe:/a:openresty:openresty",
+            "regex": "Server:%s*openresty[/%s]*(%d[%d.]+)"
         },
         "Outlook Web Access": {
             "cpe": "cpe:/a:microsoft:outlook_web_access",
@@ -292,6 +316,10 @@
             "cpe": "cpe:/a:w3edge:total_cache",
             "regex": "X%-Powered%-By:%s*W3%s*Total%s*Cache[/%s]*(%d[%d.]+)"
         },
+        "Traefik": {
+            "cpe": "cpe:/a:traefik:traefik",
+            "regex": "Server:%s*Traefik[/%s]*(%d[%d.]+)"
+        },
         "Traffic Server": {
             "cpe": "cpe:/a:apache:traffic_server",
             "regex": "Server:%s*ATS[/%s]*(%d[%d.]+)"
@@ -304,9 +332,17 @@
             "cpe": "cpe:/a:redhat:undertow",
             "regex": "X%-Powered%-By:%s*Undertow[/%s]*(%d[%d.]+)"
         },
+        "Uvicorn": {
+            "cpe": "cpe:/a:encode:uvicorn",
+            "regex": "Server:%s*uvicorn[/%s]*(%d[%d.]+)"
+        },
         "Varnish": {
             "cpe": "cpe:/a:varnish-cache:varnish",
             "regex": "Via:%s*varnish%s*%(Varnish[/%s]*(%d[%d.]+)%)"
+        },
+        "Werkzeug": {
+            "cpe": "cpe:/a:palletsprojects:werkzeug",
+            "regex": "Server:%s*Werkzeug[/%s]*(%d[%d.]+)"
         },
         "Xitami": {
             "cpe": "cpe:/a:imatix:xitami",
@@ -458,9 +494,17 @@
                 "<title>FishEye%s*(%d[%d.]+)</title>"
             ]
         },
+        "GitLab": {
+            "cpe": "cpe:/a:gitlab:gitlab",
+            "regex": "content=\"GitLab\".*gon%.gitlab_url"
+        },
         "GlassFish Server": {
             "cpe": "cpe:/a:oracle:glassfish_server",
             "regex": "GlassFish%s*Server%s*Open%s*Source%s*Edition%s*(%d[%d.]+)"
+        },
+        "Grafana": {
+            "cpe": "cpe:/a:grafana:grafana",
+            "regex": "grafana%-app.*version\":\"(%d[%d.]+)"
         },
         "HandlebarsJS": {
             "cpe": "cpe:/a:handlebarsjs:handlebars",
@@ -590,6 +634,13 @@
                 "/(%d[%d.]+)/knockout%.slim%.min%.js"
             ]
         },
+        "Laravel": {
+            "cpe": "cpe:/a:laravel:laravel",
+            "regex": [
+                "content=[\"']csrf%-token[\"']",
+                "/vendor/laravel/"
+            ]
+        },
         "Liferay Portal": {
             "cpe": "cpe:/a:liferay:liferay_portal",
             "regex": [
@@ -669,9 +720,23 @@
             "cpe": "cpe:/a:rapid7:nexpose",
             "regex": "NSC[/%s]*(%d[%d.]+)%s*%.JVM%."
         },
+        "Next.js": {
+            "cpe": "cpe:/a:vercel:next.js",
+            "regex": [
+                "/_next/static/",
+                "__NEXT_DATA__"
+            ]
+        },
         "NextGEN Gallery": {
             "cpe": "cpe:/a:imagely:nextgen_gallery",
             "regex": "<!%-%-%s*<meta%s*name=\"NextGEN\"%s*version=\"(%d[%d.]+)\"[/%s]*>%s*%-%->"
+        },
+        "Nuxt.js": {
+            "cpe": "cpe:/a:nuxt:nuxt.js",
+            "regex": [
+                "__NUXT__",
+                "/_nuxt/"
+            ]
         },
         "OpenCMS": {
             "cpe": "cpe:/a:alkacon:opencms",
@@ -742,6 +807,10 @@
                 "<p%s*class=\"footer\">&copy;%s*[%-%d]+%s*Splunk%s*Inc%.%s*Splunk%s*(%d[%d.]+)[^<]*</p>"
             ]
         },
+        "Spring Boot": {
+            "cpe": "cpe:/a:vmware:spring_boot",
+            "regex": "Whitelabel%s*Error%s*Page"
+        },
         "Squid": {
             "cpe": "cpe:/a:squid-cache:squid",
             "regex": "squid[/%s]*(%d[%d.]+)"
@@ -788,6 +857,15 @@
             "cpe": "cpe:/a:varnish-cache:varnish",
             "regex": "Varnish[/%s]*(%d[%d.]+)"
         },
+        "Vue.js": {
+            "cpe": "cpe:/a:vuejs:vue.js",
+            "regex": [
+                "/vue/(%d[%d.]+)/",
+                "/vue%-(%d[%d.]+)%.js",
+                "/vue%-(%d[%d.]+)%.min%.js",
+                "data%-v%-[a-f0-9]+"
+            ]
+        },
         "Web Toolkit": {
             "cpe": "cpe:/a:google:web_toolkit",
             "regex": "%.gwt_version%s*=%s*\"(%d[%d.]+)\""
@@ -832,6 +910,82 @@
                 "/(%d[%d.]+)/yui%.slim%.js",
                 "/(%d[%d.]+)/yui%.slim%.min%.js"
             ]
+        }
+    },
+    "meta": {
+        "WordPress": {
+            "cpe": "cpe:/a:wordpress:wordpress",
+            "regex": "<meta%s+name=[\"']generator[\"']%s+content=[\"']WordPress%s*(%d[%d.]+)"
+        },
+        "Drupal": {
+            "cpe": "cpe:/a:drupal:drupal",
+            "regex": "<meta%s+name=[\"']generator[\"']%s+content=[\"']Drupal%s*(%d[%d.]+)"
+        },
+        "Joomla": {
+            "cpe": "cpe:/a:joomla:joomla%21",
+            "regex": "<meta%s+name=[\"']generator[\"']%s+content=[\"']Joomla!?%s*(%d[%d.]+)"
+        },
+        "Ghost": {
+            "cpe": "cpe:/a:ghost:ghost",
+            "regex": "<meta%s+name=[\"']generator[\"']%s+content=[\"']Ghost%s*(%d[%d.]+)"
+        },
+        "Hugo": {
+            "cpe": "cpe:/a:gohugio:hugo",
+            "regex": "<meta%s+name=[\"']generator[\"']%s+content=[\"']Hugo%s*(%d[%d.]+)"
+        },
+        "Mediawiki": {
+            "cpe": "cpe:/a:mediawiki:mediawiki",
+            "regex": "<meta%s+name=[\"']generator[\"']%s+content=[\"']MediaWiki%s*(%d[%d.]+)"
+        },
+        "Typo3": {
+            "cpe": "cpe:/a:typo3:typo3",
+            "regex": "<meta%s+name=[\"']generator[\"']%s+content=[\"']TYPO3%s*CMS%s*(%d[%d.]+)"
+        },
+        "Plone": {
+            "cpe": "cpe:/a:plone:plone",
+            "regex": "<meta%s+name=[\"']generator[\"']%s+content=[\"']Plone%s*(%d[%d.]+)"
+        }
+    },
+    "cookie": {
+        "PHP": {
+            "cpe": "cpe:/a:php:php",
+            "regex": "PHPSESSID"
+        },
+        "Java": {
+            "cpe": "cpe:/a:oracle:jre",
+            "regex": "JSESSIONID"
+        },
+        "ASP.Net": {
+            "cpe": "cpe:/a:microsoft:asp.net",
+            "regex": "ASP%.NET_SessionId"
+        },
+        "Django": {
+            "cpe": "cpe:/a:djangoproject:django",
+            "regex": "csrftoken"
+        },
+        "Laravel": {
+            "cpe": "cpe:/a:laravel:laravel",
+            "regex": "laravel_session"
+        },
+        "Express": {
+            "cpe": "cpe:/a:expressjs:express",
+            "regex": "connect%.sid"
+        },
+        "Rails": {
+            "cpe": "cpe:/a:rubyonrails:ruby_on_rails",
+            "regex": "_session_id"
+        },
+        "ColdFusion": {
+            "cpe": "cpe:/a:adobe:coldfusion",
+            "regex": "CFID"
+        },
+        "WordPress": {
+            "cpe": "cpe:/a:wordpress:wordpress",
+            "regex": "wordpress_logged_in"
+        },
+        "Drupal": {
+            "cpe": "cpe:/a:drupal:drupal",
+            "regex": "SESS[a-f0-9]+"
         }
     },
     "external": {

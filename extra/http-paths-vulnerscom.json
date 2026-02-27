@@ -1,35 +1,70 @@
 {
-    "extension": [
-        "",
-        ".asp",
-        ".aspx",
-        ".cfm",
-        ".cfml",
-        ".cgi",
-        ".htm",
-        ".html",
-        ".htmlx",
-        ".jhtml",
-        ".jsa",
-        ".jsp",
-        ".php",
-        ".php3",
-        ".pl",
-        ".shtm",
-        ".shtml"
+    "fallback": [
+        "/index.html",
+        "/index.php",
+        "/index.jsp",
+        "/default.aspx",
+        "/admin"
     ],
-    "path": [
-        "",
-        "admin",
-        "base",
-        "default",
-        "home",
-        "index",
-        "indice",
-        "inicio",
-        "localstart",
-        "menu",
-        "main",
-        "start"
-    ]
+    "version_endpoints": {
+        "cpe:/a:jenkins:jenkins": {
+            "path": "/api/json",
+            "regex": "\"version\"%s*:%s*\"(%d[%d.]+)\""
+        },
+        "cpe:/a:wordpress:wordpress": {
+            "path": "/feed/",
+            "regex": "<generator>[^<]*(%d[%d.]+)</generator>"
+        },
+        "cpe:/a:atlassian:jira": {
+            "path": "/rest/api/latest/serverInfo",
+            "regex": "\"version\"%s*:%s*\"(%d[%d.]+)\""
+        },
+        "cpe:/a:atlassian:confluence": {
+            "path": "/rest/applinks/1.0/manifest",
+            "regex": "\"version\"%s*:%s*\"(%d[%d.]+)\""
+        },
+        "cpe:/a:apache:tomcat": {
+            "path": "/",
+            "regex": "Apache%s*Tomcat[/%s]*(%d[%d.]+)"
+        },
+        "cpe:/a:grafana:grafana": {
+            "path": "/api/health",
+            "regex": "\"version\"%s*:%s*\"(%d[%d.]+)\""
+        }
+    },
+    "legacy": {
+        "extension": [
+            "",
+            ".asp",
+            ".aspx",
+            ".cfm",
+            ".cfml",
+            ".cgi",
+            ".htm",
+            ".html",
+            ".htmlx",
+            ".jhtml",
+            ".jsa",
+            ".jsp",
+            ".php",
+            ".php3",
+            ".pl",
+            ".shtm",
+            ".shtml"
+        ],
+        "path": [
+            "",
+            "admin",
+            "base",
+            "default",
+            "home",
+            "index",
+            "indice",
+            "inicio",
+            "localstart",
+            "menu",
+            "main",
+            "start"
+        ]
+    }
 }

@@ -50,6 +50,9 @@ CVEs information gathered from nvd.nist.gov.
 -- db: Modify the database file location. Default: cve.db
 -- maxcve: Limit the number of CVEs printed on screen. Default: 10
 -- http: Modify HTTP analysis behaviour. Default: 1 (enabled). Possible values: 0, 1
+-- httpmode: HTTP analysis strategy. Default: smart. Possible values: smart, legacy
+--   smart:  Phased approach - root page first, then adaptive probes (5-15 requests)
+--   legacy: Original cartesian path x extension enumeration (~190 requests)
 -- maxredirect: Limit the number of redirections. Default: 1
 -- log: Modify the output .log file location. Default: cvescannerv3.log
 -- json: Modify the output .json file location. Default: cvescannerv3.json
@@ -84,6 +87,7 @@ local json_arg = stdnse.get_script_args('json') or 'cvescannerv3.json'
 local path_arg = stdnse.get_script_args('path') or 'extra/http-paths-vulnerscom.json'
 local regex_arg = stdnse.get_script_args('regex') or 'extra/http-regex-vulnerscom.json'
 local aliases_arg = stdnse.get_script_args('aliases') or 'extra/product-aliases.json'
+local httpmode_arg = stdnse.get_script_args('httpmode') or 'smart'
 local service_arg = stdnse.get_script_args('service') or 'all'
 local version_arg = stdnse.get_script_args('version') or 'all'
 
@@ -310,11 +314,16 @@ local function redirect(_, _)
    end
 end
 
-local function http_match (host, port, matches)
+local function http_match_legacy (host, port, matches)
    local consecutive_errors = 0
    local max_errors = 3
-   for _, path in pairs(registry.path['path']) do
-      for _, ext in pairs(registry.path['extension']) do
+   -- Support both new format (legacy.path) and old format (path at root)
+   local path_list = (registry.path['legacy'] and registry.path['legacy']['path'])
+                     or registry.path['path']
+   local ext_list = (registry.path['legacy'] and registry.path['legacy']['extension'])
+                    or registry.path['extension']
+   for _, path in pairs(path_list) do
+      for _, ext in pairs(ext_list) do
          local file = "/" .. path .. ext
          if (path == '' and ext == '') or path ~= '' then
             if consecutive_errors >= max_errors then
@@ -411,6 +420,222 @@ local function http_match (host, port, matches)
          stdnse.verbose(1, fmt("Aborting HTTP scan for %s:%s after %d consecutive errors",
                                host.ip, port.number, consecutive_errors))
          break
+      end
+   end
+end
+
+
+local function body_hash (body)
+   if not body or body == "" then return "" end
+   local len = #body
+   local head = body:sub(1, 64)
+   local tail = body:sub(-64)
+   return fmt("%d:%s:%s", len, head, tail)
+end
+
+
+local function cookie_match (resp, matches)
+   if not registry.regex['cookie'] then return end
+   -- Parse Set-Cookie headers for technology fingerprinting
+   if resp.rawheader then
+      for _, header in pairs(resp.rawheader) do
+         if header:lower():find("^set%-cookie:") then
+            for _, software in pairs(registry.regex['cookie']) do
+               if type(software.regex) == 'table' then
+                  for _, regex in pairs(software.regex) do
+                     find_version(software.cpe, header, regex, matches)
+                  end
+               else
+                  find_version(software.cpe, header, software.regex, matches)
+               end
+            end
+         end
+      end
+   end
+end
+
+
+local function http_get_opts ()
+   return {
+      redirect_ok = redirect,
+      timeout = 15000,
+      bypass_cache = true,
+      no_cache = true,
+      no_cache_body = true
+   }
+end
+
+
+local function process_external_js (host, port, resp, matches)
+   local idx = 0
+   local lib_path = nil
+   local libs = {['size'] = 0}
+   while true do
+      _, idx, lib_path = resp.rawbody:find(
+         registry.regex['external']['path_regex'], idx + 1)
+      if lib_path and lib_path:sub(1, 1) == '/' then
+         local lib_resp = http.get(host, port, lib_path, http_get_opts())
+         if lib_resp.status and lib_resp.rawbody ~= nil then
+            local _, _, lib_comm = lib_resp.rawbody:find(
+               registry.regex['external']['comment_regex'])
+            if lib_comm then
+               stdnse.verbose(3, "Comment: " .. lib_comm)
+               local idy = 0
+               local comm_lib = nil
+               local comm_ver = nil
+               while true do
+                  _, idy, comm_lib, comm_ver = lib_comm:find(
+                     registry.regex['external']['version_regex'],
+                     idy + 1)
+                  if comm_lib and comm_ver then
+                     if comm_lib:lower() ~= 'version' then
+                        stdnse.verbose(2,
+                                       "Matched version in js " ..
+                                       "comment: " .. comm_lib ..
+                                       " ver: " .. comm_ver)
+                        libs[comm_lib] = comm_ver
+                        libs['size'] = libs['size'] + 1
+                     end
+                  end
+                  if idy == nil then break end
+               end
+            end
+         end
+      end
+      if idx == nil then break end
+   end
+   if libs['size'] > 0 then
+      for name, data in pairs(registry.regex['body']) do
+         for k, v in pairs(libs) do
+            if k ~= 'size' then
+               local k_stripped = (k:gsub('%.js', '')):lower()
+               if (name:lower()):find(k_stripped) then
+                  add_cpe_version(data['cpe'], v, matches, 'http')
+               end
+            end
+         end
+      end
+   end
+end
+
+
+local function process_response_body (resp, matches, seen_bodies)
+   if resp.rawbody and resp.rawbody ~= "" then
+      local hash = body_hash(resp.rawbody)
+      if not seen_bodies[hash] then
+         seen_bodies[hash] = true
+         regex_match(resp.rawbody, 'body', matches)
+         -- Meta generator detection
+         if registry.regex['meta'] then
+            regex_match(resp.rawbody, 'meta', matches)
+         end
+         return true
+      end
+   end
+   return false
+end
+
+
+local function http_match_smart (host, port, matches)
+   local seen_bodies = {}
+   local headers_scanned = false
+   local body_matched = false
+   local max_version_probes = 3
+
+   -- Phase 1: Root request (always executed, 1 request)
+   stdnse.verbose(1, fmt("Smart HTTP scan Phase 1: GET / on %s:%s",
+                          host.ip, port.number))
+   local resp = http.get(host, port, "/", http_get_opts())
+
+   if not resp.status then
+      stdnse.verbose(1, fmt("Root request failed for %s:%s: %s",
+                             host.ip, port.number, resp['status-line'] or "unknown"))
+      return
+   end
+
+   -- Process headers (only once)
+   if #resp.rawheader > 0 then
+      for _, header in pairs(resp.rawheader) do
+         regex_match(header, 'header', matches)
+      end
+      headers_scanned = true
+   end
+
+   -- Process cookies
+   cookie_match(resp, matches)
+
+   -- Process body (only on 2xx responses)
+   if resp.status >= 200 and resp.status < 300 then
+      body_matched = process_response_body(resp, matches, seen_bodies)
+   end
+
+   -- Process external JS resources (from root page)
+   if resp.status and resp.rawbody and resp.rawbody ~= "" then
+      process_external_js(host, port, resp, matches)
+   end
+
+   -- Phase 2: Targeted fallback probes (only if root body yielded nothing)
+   if not body_matched then
+      local fallback_paths = registry.path['fallback']
+      if fallback_paths then
+         stdnse.verbose(1, fmt("Smart HTTP scan Phase 2: fallback probes on %s:%s",
+                                host.ip, port.number))
+         local consecutive_errors = 0
+         for _, file in pairs(fallback_paths) do
+            if consecutive_errors >= 3 then
+               stdnse.verbose(1, fmt("Aborting Phase 2 for %s:%s after 3 consecutive errors",
+                                      host.ip, port.number))
+               break
+            end
+            local fb_resp = http.get(host, port, file, http_get_opts())
+            if not fb_resp.status then
+               consecutive_errors = consecutive_errors + 1
+            else
+               consecutive_errors = 0
+               -- Headers only if not yet scanned (e.g., root failed)
+               if not headers_scanned and #fb_resp.rawheader > 0 then
+                  for _, header in pairs(fb_resp.rawheader) do
+                     regex_match(header, 'header', matches)
+                  end
+                  cookie_match(fb_resp, matches)
+                  headers_scanned = true
+               end
+               -- Body only on 2xx responses
+               if fb_resp.status >= 200 and fb_resp.status < 300 then
+                  if process_response_body(fb_resp, matches, seen_bodies) then
+                     body_matched = true
+                  end
+               end
+            end
+         end
+      end
+   end
+
+   -- Phase 3: Version endpoint probes for detected products
+   local version_endpoints = registry.path['version_endpoints']
+   if version_endpoints then
+      local probes_sent = 0
+      for cpe, endpoint in pairs(version_endpoints) do
+         if probes_sent >= max_version_probes then break end
+         -- Check if this CPE prefix was detected
+         local cpe_detected = false
+         for detected_cpe, _ in pairs(matches['data']['http']) do
+            if detected_cpe:find(cpe, 1, true) then
+               cpe_detected = true
+               break
+            end
+         end
+         if cpe_detected then
+            stdnse.verbose(1, fmt("Smart HTTP scan Phase 3: probing %s for %s",
+                                   endpoint.path, cpe))
+            local ep_resp = http.get(host, port, endpoint.path, http_get_opts())
+            if ep_resp.status and ep_resp.status >= 200 and ep_resp.status < 300 then
+               if ep_resp.rawbody and ep_resp.rawbody ~= "" then
+                  find_version(cpe, ep_resp.rawbody, endpoint.regex, matches)
+               end
+            end
+            probes_sent = probes_sent + 1
+         end
       end
    end
 end
@@ -1036,7 +1261,11 @@ portaction = function (host, port)
       and (shortport.http(host, port)
            or shortport.ssl(host, port)
            or port.service == 'upnp') then
-      http_match(host, port, matches)
+      if httpmode_arg == 'legacy' then
+         http_match_legacy(host, port, matches)
+      else
+         http_match_smart(host, port, matches)
+      end
    end
    local vulns
    if matches['size'] ~= 0 then
