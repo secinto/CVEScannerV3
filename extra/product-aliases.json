@@ -1,3 +1,10 @@
 {
-  "iis": ["internet_information_services"]
+    "iis": ["internet_information_services"],
+    "nginx": ["nginx_plus"],
+    "tomcat": ["tomcat_native"],
+    "http_server": ["httpd"],
+    "asp.net": ["asp.net_core"],
+    "express": ["express.js"],
+    "next.js": ["nextjs"],
+    "vue.js": ["vue"]
 }
