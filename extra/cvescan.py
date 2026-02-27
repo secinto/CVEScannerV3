@@ -79,6 +79,9 @@ def parse_version(version):
         return {"ver": "*", "vup": "*", "from_": None, "to_": None,
                 "empty": True, "range_": False}
 
+    # Strip nmap platform markers (mirrors Lua: version:gsub('for_windows_', ''))
+    version = version.replace("for_windows_", "")
+
     # Range patterns: "3.x - 4.x" or "3.3.x - 3.4.x"
     m = re.match(r"([^-]*)\s+-\s+([^-]*)", version)
     if m:
@@ -386,8 +389,15 @@ def resolve_aliases(product, aliases):
 # High-level scan orchestration
 # ---------------------------------------------------------------------------
 
-def scan_service(cur, service, aliases, maxcve):
-    """Scan a single service entry and return a result dict."""
+def scan_service(cur, service, aliases, maxcve, cache=None):
+    """Scan a single service entry and return a result dict.
+
+    cache: optional dict shared across services to avoid re-querying the same
+           product|version|vupdate combination.  Mirrors Lua registry.cache.
+    """
+    if cache is None:
+        cache = {}
+
     # Resolve product and version info
     if "cpe" in service and service["cpe"]:
         product, version_info = parse_cpe(service["cpe"])
@@ -417,14 +427,14 @@ def scan_service(cur, service, aliases, maxcve):
     # Query for all product name variants (original + aliases)
     all_products = resolve_aliases(product, aliases)
     all_vulns = {}
-    cache = {}
 
     for prod_name in all_products:
         cache_key = f"{prod_name}|{ver_display}|{vup_display}"
         if cache_key in cache:
+            all_vulns.update(cache[cache_key])
             continue
         prod_vulns = find_vulnerabilities(cur, prod_name, version_info)
-        cache[cache_key] = True
+        cache[cache_key] = prod_vulns
         all_vulns.update(prod_vulns)
 
     # Sort by CVSS score
@@ -469,10 +479,11 @@ def run_scan(db_path, services, aliases=None, maxcve=0):
     Returns the full output dict with metadata and results.
     """
     results = []
+    cache = {}  # shared across all services (mirrors Lua registry.cache)
     with closing(sql.connect(db_path)) as conn:
         with closing(conn.cursor()) as cur:
             for service in services:
-                result = scan_service(cur, service, aliases, maxcve)
+                result = scan_service(cur, service, aliases, maxcve, cache)
                 if result is not None:
                     results.append(result)
 

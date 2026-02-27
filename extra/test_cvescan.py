@@ -285,6 +285,16 @@ class TestParseVersion(unittest.TestCase):
         self.assertEqual(info["from_"], "3.3.x")
         self.assertEqual(info["to_"], "3.4.x")
 
+    def test_for_windows_stripped(self):
+        info = parse_version("4.7for_windows_p1")
+        self.assertEqual(info["ver"], "4.7")
+        self.assertEqual(info["vup"], "p1")
+
+    def test_for_windows_stripped_simple(self):
+        info = parse_version("for_windows_4.7")
+        self.assertEqual(info["ver"], "4.7")
+        self.assertEqual(info["vup"], "*")
+
 
 class TestParseCpe(unittest.TestCase):
     def test_full_cpe(self):
@@ -584,6 +594,21 @@ class TestRunScan(unittest.TestCase):
         self.assertIn("results", output)
         self.assertEqual(len(output["results"]), 2)
         self.assertEqual(output["metadata"]["version"], "3.4")
+
+    def test_cache_shared_across_services(self):
+        """Same product/version appearing twice should produce identical results
+        and benefit from the shared cache."""
+        services = [
+            {"id": "ssh1", "product": "openssh", "version": "4.7"},
+            {"id": "ssh2", "product": "openssh", "version": "4.7"},
+        ]
+        output = run_scan(str(self.db_path), services)
+        r1 = output["results"][0]
+        r2 = output["results"][1]
+        self.assertEqual(r1["total_cves"], r2["total_cves"])
+        cves1 = {c["cve_id"] for c in r1["cves"]}
+        cves2 = {c["cve_id"] for c in r2["cves"]}
+        self.assertEqual(cves1, cves2)
 
 
 # ---------------------------------------------------------------------------
