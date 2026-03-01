@@ -50,9 +50,6 @@ CVEs information gathered from nvd.nist.gov.
 -- db: Modify the database file location. Default: cve.db
 -- maxcve: Limit the number of CVEs printed on screen. Default: 10
 -- http: Modify HTTP analysis behaviour. Default: 1 (enabled). Possible values: 0, 1
--- httpmode: HTTP analysis strategy. Default: smart. Possible values: smart, legacy
---   smart:  Phased approach - root page first, then adaptive probes (5-15 requests)
---   legacy: Original cartesian path x extension enumeration (~190 requests)
 -- maxredirect: Limit the number of redirections. Default: 1
 -- log: Modify the output .log file location. Default: cvescannerv3.log
 -- json: Modify the output .json file location. Default: cvescannerv3.json
@@ -82,12 +79,9 @@ local http_arg = stdnse.get_script_args('http') or '1'
 local maxredirect_arg = tonumber(stdnse.get_script_args('maxredirect')) or 1
 local log_arg = stdnse.get_script_args('log') or 'cvescannerv3.log'
 local json_arg = stdnse.get_script_args('json') or 'cvescannerv3.json'
--- local word_arg = stdnse.get_script_args('word') or nil
--- local ext_arg = stdnse.get_script_args('ext') or nil
 local path_arg = stdnse.get_script_args('path') or 'extra/http-paths-vulnerscom.json'
 local regex_arg = stdnse.get_script_args('regex') or 'extra/http-regex-vulnerscom.json'
 local aliases_arg = stdnse.get_script_args('aliases') or 'extra/product-aliases.json'
-local httpmode_arg = stdnse.get_script_args('httpmode') or 'smart'
 local service_arg = stdnse.get_script_args('service') or 'all'
 local version_arg = stdnse.get_script_args('version') or 'all'
 
@@ -313,117 +307,6 @@ local function redirect(_, _)
       return true
    end
 end
-
-local function http_match_legacy (host, port, matches)
-   local consecutive_errors = 0
-   local max_errors = 3
-   -- Support both new format (legacy.path) and old format (path at root)
-   local path_list = (registry.path['legacy'] and registry.path['legacy']['path'])
-                     or registry.path['path']
-   local ext_list = (registry.path['legacy'] and registry.path['legacy']['extension'])
-                    or registry.path['extension']
-   for _, path in pairs(path_list) do
-      for _, ext in pairs(ext_list) do
-         local file = "/" .. path .. ext
-         if (path == '' and ext == '') or path ~= '' then
-            if consecutive_errors >= max_errors then
-               stdnse.verbose(2, fmt("Skipping http://%s:%s%s: %d consecutive errors",
-                                     host.ip, port.number, file, consecutive_errors))
-               break
-            end
-            local resp = http.get(host, port, file,
-                                  {
-                                     redirect_ok = redirect,
-                                     timeout = 15000,
-                                     bypass_cache = true,
-                                     no_cache = true,
-                                     no_cache_body = true
-                                  }
-            )
-            if not resp.status then
-               consecutive_errors = consecutive_errors + 1
-               stdnse.verbose(2, fmt("Error processing request http://%s:%s%s => %s",
-                                     host.ip, port.number, file, resp['status-line']))
-            else
-               consecutive_errors = 0
-               if #resp.rawheader > 0 then
-                  for _, header in pairs(resp.rawheader) do
-                     regex_match(header, 'header', matches)
-                  end
-               end
-               if resp.rawbody ~= "" then
-                  regex_match(resp.rawbody, 'body', matches)
-               end
-            end
-            if path == '' and ext == '' and resp.status then
-               local idx = 0
-               local lib_path = nil
-               local libs = {['size'] = 0}
-               while true do
-                  _, idx, lib_path = resp.rawbody:find(
-                     registry.regex['external']['path_regex'], idx + 1)
-                  if lib_path and lib_path:sub(1, 1) == '/' then
-                     local lib_resp = http.get(host, port, lib_path,
-                                               {
-                                                  redirect_ok = redirect,
-                                                  timeout = 15000,
-                                                  bypass_cache = true,
-                                                  no_cache = true,
-                                                  no_cache_body = true
-                                               }
-                     )
-                     if lib_resp.status and lib_resp.rawbody ~= nil then
-                        local _, _, lib_comm = lib_resp.rawbody:find(
-                           registry.regex['external']['comment_regex'])
-                        if lib_comm then
-                           stdnse.verbose(3, "Comment: " .. lib_comm)
-                           local idy = 0
-                           local comm_lib = nil
-                           local comm_ver = nil
-                           while true do
-                              _, idy, comm_lib, comm_ver = lib_comm:find(
-                                 registry.regex['external']['version_regex'],
-                                 idy + 1)
-                              if comm_lib and comm_ver then
-                                 if comm_lib:lower() ~= 'version' then
-                                    stdnse.verbose(2,
-                                                   "Matched version in js " ..
-                                                   "comment: " .. comm_lib ..
-                                                   " ver: " .. comm_ver)
-                                    libs[comm_lib] = comm_ver
-                                    libs['size'] = libs['size'] + 1
-                                 end
-                              end
-                              if idy == nil then break end
-                           end
-                        end
-                     end
-                  end
-                  if idx == nil then break end
-               end
-               if libs['size'] > 0 then
-                  for name, data in pairs(registry.regex['body']) do
-                     for k, v in pairs(libs) do
-                        if k ~= 'size' then
-                           local k_stripped = (k:gsub('%.js', '')):lower()
-                           if (name:lower()):find(k_stripped) then
-                              add_cpe_version(data['cpe'], v, matches, 'http')
-                           end
-                        end
-                     end
-                  end
-               end
-            end
-         end
-      end
-      if consecutive_errors >= max_errors then
-         stdnse.verbose(1, fmt("Aborting HTTP scan for %s:%s after %d consecutive errors",
-                               host.ip, port.number, consecutive_errors))
-         break
-      end
-   end
-end
-
 
 local function body_hash (body)
    if not body or body == "" then return "" end
@@ -694,27 +577,7 @@ end
 
 
 local function query (qtype)
-   if qtype == 'cve_score' then
-      return [[
-             SELECT cvss_v2, cvss_v3
-             FROM cves
-             WHERE cve_id = '%s'
-             ]]
-   elseif qtype == 'exploit_info' then
-      return [[
-             SELECT exploits.exploit_id, exploits.name
-             FROM referenced_exploit
-             INNER JOIN exploits ON referenced_exploit.exploit_id = exploits.exploit_id
-             WHERE referenced_exploit.cve_id = '%s'
-             ]]
-   elseif qtype == 'metasploit_info' then
-      return [[
-             SELECT metasploits.name
-             FROM referenced_metasploit
-             INNER JOIN metasploits ON referenced_metasploit.metasploit_id = metasploits.metasploit_id
-             WHERE referenced_metasploit.cve_id = '%s'
-             ]]
-   elseif qtype == 'multiaffected' then
+   if qtype == 'multiaffected' then
       return [[
              SELECT multiaffected.cve_id, cves.cvss_v2, cves.cvss_v3,
              multiaffected.versionStartIncluding, multiaffected.versionStartExcluding,
@@ -753,17 +616,61 @@ local function query (qtype)
 end
 
 
-local function dump_exploit (host, port, vuln)
+local function batch_exploit_info (sorted)
+   -- Batch-fetch exploit and metasploit references for all CVEs at once.
+   -- Returns (exploit_map, msf_map) where each maps cve_id -> list of entries.
+   -- Uses 2 queries total instead of 2*N.
+   local exploit_map = {}
+   local msf_map = {}
+
+   if #sorted == 0 then return exploit_map, msf_map end
+
+   -- Build IN clause from CVE IDs
+   local cve_list = {}
+   for _, value in pairs(sorted) do
+      table.insert(cve_list, fmt("'%s'", sql_escape(value[1])))
+   end
+   local in_clause = table.concat(cve_list, ",")
+
+   -- Query all exploit references
+   local cur = registry.conn:execute(fmt([[
+      SELECT referenced_exploit.cve_id, exploits.exploit_id, exploits.name
+      FROM referenced_exploit
+      INNER JOIN exploits ON referenced_exploit.exploit_id = exploits.exploit_id
+      WHERE referenced_exploit.cve_id IN (%s)
+   ]], in_clause))
+   local cve_id, exploit_id, name = cur:fetch()
+   while cve_id do
+      if not exploit_map[cve_id] then exploit_map[cve_id] = {} end
+      table.insert(exploit_map[cve_id], {id = exploit_id, name = name})
+      cve_id, exploit_id, name = cur:fetch()
+   end
+   cur:close()
+
+   -- Query all metasploit references
+   cur = registry.conn:execute(fmt([[
+      SELECT referenced_metasploit.cve_id, metasploits.name
+      FROM referenced_metasploit
+      INNER JOIN metasploits ON referenced_metasploit.metasploit_id = metasploits.metasploit_id
+      WHERE referenced_metasploit.cve_id IN (%s)
+   ]], in_clause))
+   local msf_cve, msf_name = cur:fetch()
+   while msf_cve do
+      if not msf_map[msf_cve] then msf_map[msf_cve] = {} end
+      table.insert(msf_map[msf_cve], msf_name)
+      msf_cve, msf_name = cur:fetch()
+   end
+   cur:close()
+
+   return exploit_map, msf_map
+end
+
+
+local function dump_exploit (host, port, vuln, cvssv2, cvssv3, exploit_map, msf_map)
    local _ip = host.ip
    local _port = fmt('%s/%s', port.number, port.protocol)
-   local cur_score, cur_exp, cur_msf
 
-   -- Dump the CVE score
-   cur_score = registry.conn:execute(
-      fmt(query('cve_score'), sql_escape(vuln))
-   )
-   local cvssv2, cvssv3 = cur_score:fetch()
-   cur_score:close()
+   -- Log the CVE score (no query needed - scores passed directly)
    log("[-] \tid: %-18s\tcvss_v2: %-5s\tcvss_v3: %-5s", vuln, cvssv2, cvssv3 or "-")
    local t_serv = #registry.json_out[_ip]['ports'][_port]['services']
    registry.json_out[_ip]['ports'][_port]['services'][t_serv]['vulnerabilities']['cves'][vuln] = {
@@ -771,45 +678,33 @@ local function dump_exploit (host, port, vuln)
       ['cvssv3'] = cvssv3 or "-"
    }
 
-   -- Dump exploits from Exploit-DB
-   cur_exp = registry.conn:execute(
-      fmt(query('exploit_info'), sql_escape(vuln))
-   )
-   local exploit, name = cur_exp:fetch()
-   if exploit then
+   -- Dump exploits from pre-fetched data
+   if exploit_map[vuln] then
       log("[!] \t\tExploitDB:")
       registry.json_out[_ip]['ports'][_port]['services'][t_serv]['vulnerabilities']['cves'][vuln]['exploitdb'] = {}
       local exp_list = registry.json_out[_ip]['ports'][_port]['services'][t_serv]['vulnerabilities']['cves'][vuln]['exploitdb']
-      while exploit do
-         log("[#] \t\t\tname: %s", name)
-         log("[#] \t\t\tid: %s", exploit)
-         log("[#] \t\t\turl: https://www.exploit-db.com/exploits/%s", exploit)
+      for _, exp in pairs(exploit_map[vuln]) do
+         log("[#] \t\t\tname: %s", exp.name)
+         log("[#] \t\t\tid: %s", exp.id)
+         log("[#] \t\t\turl: https://www.exploit-db.com/exploits/%s", exp.id)
          exp_list[#exp_list + 1] = {
-            ['name'] = name,
-            ['id'] = exploit,
-            ['url'] = fmt('https://www.exploit-db.com/exploits/%s', exploit)
+            ['name'] = exp.name,
+            ['id'] = exp.id,
+            ['url'] = fmt('https://www.exploit-db.com/exploits/%s', exp.id)
          }
-         exploit, name = cur_exp:fetch()
       end
    end
-   cur_exp:close()
 
-   -- Dump exploits from Metasploit
-   cur_msf = registry.conn:execute(
-      fmt(query('metasploit_info'), sql_escape(vuln))
-   )
-   name = cur_msf:fetch()
-   if name then
+   -- Dump metasploit from pre-fetched data
+   if msf_map[vuln] then
       log("[!] \t\tMetasploit:")
       registry.json_out[_ip]['ports'][_port]['services'][t_serv]['vulnerabilities']['cves'][vuln]['metasploit'] = {}
       local meta_list = registry.json_out[_ip]['ports'][_port]['services'][t_serv]['vulnerabilities']['cves'][vuln]['metasploit']
-      while name do
+      for _, name in pairs(msf_map[vuln]) do
          log("[#] \t\t\tname: %s", name)
          meta_list[#meta_list + 1] = {['name'] = name}
-         name = cur_msf:fetch()
       end
    end
-   cur_msf:close()
 end
 
 
@@ -1059,6 +954,9 @@ local function vulnerabilities (host, port, cpe, product, info)
    table.sort(sorted, cvss_comparator)
    log("[+] cves: %d", #sorted)
 
+   -- Batch-fetch exploit/metasploit info (2 queries instead of 3*N)
+   local exploit_map, msf_map = batch_exploit_info(sorted)
+
    -- Insert total vulnerabilities found
    local output = {}
    table.insert(output, #sorted)
@@ -1088,7 +986,7 @@ local function vulnerabilities (host, port, cpe, product, info)
       )
    end
    for _, value in pairs(sorted) do
-      dump_exploit(host, port, value[1])
+      dump_exploit(host, port, value[1], value[2], value[3], exploit_map, msf_map)
       if cnt < maxcve_arg then
          table.insert(output,
                       fmt(
@@ -1145,10 +1043,10 @@ local function analysis (host, port, matches)
                               "CVE ID", "CVSSv2", "CVSSv3", "ExploitDB", "Metasploit"
                           )
                         )
-                        stdnse.verbose(2, "Caching " .. product .. "|" ..
-                           v .. "|" .. vu .. " vulnerabilities.")
                      end
                      registry.cache[cache_key] = { nvulns, tmp_vulns }
+                     stdnse.verbose(2, "Caching " .. product .. "|" ..
+                        v .. "|" .. vu .. " vulnerabilities (" .. nvulns .. ").")
                   else
                      log("[+] cves: cached")
                      local cache = registry.cache[cache_key]
@@ -1261,16 +1159,12 @@ portaction = function (host, port)
       and (shortport.http(host, port)
            or shortport.ssl(host, port)
            or port.service == 'upnp') then
-      if httpmode_arg == 'legacy' then
-         http_match_legacy(host, port, matches)
-      else
-         http_match_smart(host, port, matches)
-      end
+      http_match_smart(host, port, matches)
    end
-   local vulns
-   if matches['size'] ~= 0 then
-      vulns = analysis(host, port, matches)
+   if matches['size'] == 0 then
+      return nil
    end
+   local vulns = analysis(host, port, matches)
    if vulns == nil or #vulns == 0 then
       return nil
    end
