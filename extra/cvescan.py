@@ -134,6 +134,16 @@ def _default_version(version, default):
     return version
 
 
+def _add_cve_result(v, result):
+    """Insert a CVE candidate into the result dict if not already present."""
+    if v["id"] not in result:
+        result[v["id"]] = {
+            "cvss_v2": v["cvss_v2"], "cvss_v3": v["cvss_v3"],
+            "exploitdb": v["exploitdb"],
+            "metasploit": v["metasploit"],
+        }
+
+
 def match_exact_versions(candidates, from_v, to_v, upd, result):
     """Filter exact-match CVE candidates against target version.
     Mirrors Lua scoped_versions().
@@ -153,24 +163,14 @@ def match_exact_versions(candidates, from_v, to_v, upd, result):
                  or compare_version(pr_v + pr_vu, from_v) >= 0)
                 and (compare_version(pr_v, to_v) <= 0
                      or compare_version(pr_v + pr_vu, to_v) <= 0)):
-                if v["id"] not in result:
-                    result[v["id"]] = {
-                        "cvss_v2": v["cvss_v2"], "cvss_v3": v["cvss_v3"],
-                        "exploitdb": v["exploitdb"],
-                        "metasploit": v["metasploit"],
-                    }
+                _add_cve_result(v, result)
         else:
             # Exact match mode
             if ((compare_version(pr_v, from_v) == 0
                  and (pr_vu == upd or upd == "*"))
                 or (compare_version(pr_v + pr_vu, from_v) == 0
                     and (pr_vu == "*" or upd == "*"))):
-                if v["id"] not in result:
-                    result[v["id"]] = {
-                        "cvss_v2": v["cvss_v2"], "cvss_v3": v["cvss_v3"],
-                        "exploitdb": v["exploitdb"],
-                        "metasploit": v["metasploit"],
-                    }
+                _add_cve_result(v, result)
 
 
 def match_range_versions(candidates, from_v, to_v, result):
@@ -195,23 +195,13 @@ def match_range_versions(candidates, from_v, to_v, result):
                  or compare_version(st_ex, from_v) > 0)
                 and (compare_version(en_in, to_v) <= 0
                      or compare_version(en_ex, to_v) < 0)):
-                if v["id"] not in result:
-                    result[v["id"]] = {
-                        "cvss_v2": v["cvss_v2"], "cvss_v3": v["cvss_v3"],
-                        "exploitdb": v["exploitdb"],
-                        "metasploit": v["metasploit"],
-                    }
+                _add_cve_result(v, result)
         else:
             if (compare_version(from_v, st_in) >= 0
                 and compare_version(from_v, st_ex) > 0
                 and compare_version(to_v, en_in) <= 0
                     and compare_version(to_v, en_ex) < 0):
-                if v["id"] not in result:
-                    result[v["id"]] = {
-                        "cvss_v2": v["cvss_v2"], "cvss_v3": v["cvss_v3"],
-                        "exploitdb": v["exploitdb"],
-                        "metasploit": v["metasploit"],
-                    }
+                _add_cve_result(v, result)
 
 
 def rank_cves(cves):
@@ -301,7 +291,7 @@ QUERY_METASPLOIT_INFO = """
 
 
 def get_exploit_info(cur, cve_id):
-    """Fetch ExploitDB and Metasploit references for a CVE."""
+    """Fetch ExploitDB and Metasploit references for a single CVE."""
     exploits = []
     cur.execute(QUERY_EXPLOIT_INFO, [cve_id])
     for exploit_id, name in cur.fetchall():
@@ -317,6 +307,48 @@ def get_exploit_info(cur, cve_id):
         metasploits.append({"name": name})
 
     return exploits, metasploits
+
+
+def get_all_exploit_info(cur, cve_ids):
+    """Batch-fetch ExploitDB and Metasploit references for multiple CVEs.
+
+    Returns (exploits_by_cve, metasploits_by_cve) where each is a dict
+    mapping cve_id to a list of reference dicts.
+    Uses 2 queries total instead of 2*N.
+    """
+    if not cve_ids:
+        return {}, {}
+
+    placeholders = ",".join("?" * len(cve_ids))
+    exploits_by_cve = {}
+    metasploits_by_cve = {}
+
+    cur.execute(
+        f"SELECT referenced_exploit.cve_id, exploits.exploit_id, exploits.name "
+        f"FROM referenced_exploit "
+        f"INNER JOIN exploits ON referenced_exploit.exploit_id = exploits.exploit_id "
+        f"WHERE referenced_exploit.cve_id IN ({placeholders})",
+        cve_ids,
+    )
+    for cve_id, exploit_id, name in cur.fetchall():
+        exploits_by_cve.setdefault(cve_id, []).append({
+            "id": int(exploit_id),
+            "name": name,
+            "url": f"https://www.exploit-db.com/exploits/{exploit_id}",
+        })
+
+    cur.execute(
+        f"SELECT referenced_metasploit.cve_id, metasploits.name "
+        f"FROM referenced_metasploit "
+        f"INNER JOIN metasploits "
+        f"ON referenced_metasploit.metasploit_id = metasploits.metasploit_id "
+        f"WHERE referenced_metasploit.cve_id IN ({placeholders})",
+        cve_ids,
+    )
+    for cve_id, name in cur.fetchall():
+        metasploits_by_cve.setdefault(cve_id, []).append({"name": name})
+
+    return exploits_by_cve, metasploits_by_cve
 
 
 def find_vulnerabilities(cur, product, version_info):
@@ -399,22 +431,22 @@ def scan_service(cur, service, aliases, maxcve, cache=None):
         cache = {}
 
     # Resolve product and version info
-    if "cpe" in service and service["cpe"]:
+    if service.get("cpe"):
         product, version_info = parse_cpe(service["cpe"])
         # Allow explicit overrides
-        if "product" in service and service["product"]:
+        if service.get("product"):
             product = service["product"]
-        if "version" in service and service["version"] is not None:
+        if service.get("version") is not None:
             version_info = parse_version(service["version"])
-            if "version_update" in service and service["version_update"]:
-                version_info["vup"] = service["version_update"]
-    elif "product" in service and service["product"]:
+    elif service.get("product"):
         product = service["product"]
         version_info = parse_version(service.get("version"))
-        if "version_update" in service and service["version_update"]:
-            version_info["vup"] = service["version_update"]
     else:
         return None
+
+    vup_override = service.get("version_update")
+    if vup_override:
+        version_info["vup"] = vup_override
 
     # Determine version display strings
     if version_info["range_"]:
@@ -444,19 +476,21 @@ def scan_service(cur, service, aliases, maxcve, cache=None):
     if maxcve and maxcve > 0:
         sorted_cves = sorted_cves[:maxcve]
 
-    # Build detailed CVE list with exploit info
+    # Batch-fetch exploit info (2 queries instead of 2*N)
+    cve_ids = [cve_id for cve_id, _ in sorted_cves]
+    exploits_by_cve, metasploits_by_cve = get_all_exploit_info(cur, cve_ids)
+
     cve_list = []
     for cve_id, info in sorted_cves:
-        exploits, metasploits = get_exploit_info(cur, cve_id)
         cve_entry = {
             "cve_id": cve_id,
             "cvss_v2": _to_float(info["cvss_v2"]),
             "cvss_v3": _to_float(info["cvss_v3"]),
         }
-        if exploits:
-            cve_entry["exploitdb"] = exploits
-        if metasploits:
-            cve_entry["metasploit"] = metasploits
+        if cve_id in exploits_by_cve:
+            cve_entry["exploitdb"] = exploits_by_cve[cve_id]
+        if cve_id in metasploits_by_cve:
+            cve_entry["metasploit"] = metasploits_by_cve[cve_id]
         cve_list.append(cve_entry)
 
     result = {
@@ -649,13 +683,12 @@ def cmd_scan(args):
     services = None
 
     if args.input:
-        # JSON file or stdin
-        if args.input == "-":
-            data = json.load(sys.stdin)
-        else:
-            with open(args.input) as f:
-                data = json.load(f)
-        services = data.get("services", [])
+        source = sys.stdin if args.input == "-" else open(args.input)
+        try:
+            services = json.load(source).get("services", [])
+        finally:
+            if source is not sys.stdin:
+                source.close()
     elif args.cpe:
         services = [{"cpe": args.cpe}]
     elif args.product:
@@ -665,18 +698,15 @@ def cmd_scan(args):
         if args.update:
             svc["version_update"] = args.update
         services = [svc]
+    elif not sys.stdin.isatty():
+        services = json.load(sys.stdin).get("services", [])
     else:
-        # Try reading from stdin if it's not a terminal
-        if not sys.stdin.isatty():
-            data = json.load(sys.stdin)
-            services = data.get("services", [])
-        else:
-            print(
-                "Error: Provide input via -i/--input, --cpe, -p/--product, "
-                "or pipe JSON to stdin.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+        print(
+            "Error: Provide input via -i/--input, --cpe, -p/--product, "
+            "or pipe JSON to stdin.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if not services:
         print("Error: No services to scan.", file=sys.stderr)
