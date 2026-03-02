@@ -195,6 +195,23 @@ class Database:
                 PRIMARY KEY (cve_id, metasploit_id)
             );
 
+            CREATE TABLE IF NOT EXISTS backports (
+                cve_id TEXT NOT NULL,
+                distro TEXT NOT NULL,
+                release TEXT NOT NULL,
+                package TEXT NOT NULL,
+                fixed_version TEXT,
+                status TEXT NOT NULL,
+                UNIQUE (cve_id, distro, release, package)
+            );
+
+            CREATE TABLE IF NOT EXISTS backport_metadata (
+                id INTEGER PRIMARY KEY,
+                ecosystem TEXT NOT NULL UNIQUE,
+                last_updated TEXT,
+                record_count INTEGER
+            );
+
             PRAGMA foreign_keys = ON;
 
             CREATE INDEX IF NOT EXISTS idx_products_product
@@ -209,6 +226,10 @@ class Database:
                 ON affected(product_id);
             CREATE INDEX IF NOT EXISTS idx_multiaffected_product
                 ON multiaffected(product_id);
+            CREATE INDEX IF NOT EXISTS idx_backports_cve
+                ON backports(cve_id);
+            CREATE INDEX IF NOT EXISTS idx_backports_package_release
+                ON backports(package, distro, release);
             """
         )
 
@@ -359,8 +380,148 @@ class Database:
         self.conn.commit()
 
 
+DEFAULT_ECOSYSTEMS = ["Debian:12", "Debian:11", "Ubuntu:22.04", "Ubuntu:24.04"]
+
+OSV_BULK_URL = (
+    "https://osv-vulnerabilities.storage.googleapis.com/{ecosystem}/all.zip"
+)
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def update_backports_osv(db_path, ecosystems=None):
+    """Download OSV.dev bulk exports and populate the backports table.
+
+    Args:
+        db_path: Path to the SQLite database.
+        ecosystems: list of ecosystem strings like ["Debian:12", "Ubuntu:22.04"].
+                    Defaults to DEFAULT_ECOSYSTEMS.
+    """
+    import io
+    import json as _json
+    import zipfile
+
+    if ecosystems is None:
+        ecosystems = DEFAULT_ECOSYSTEMS
+
+    with Database(db_path) as db:
+        db.setup()
+        for ecosystem in ecosystems:
+            # ecosystem e.g. "Debian:12" → distro="Debian", release="12"
+            if ":" not in ecosystem:
+                print(f"[!] Invalid ecosystem format: {ecosystem}")
+                continue
+            distro, release = ecosystem.split(":", 1)
+
+            url = OSV_BULK_URL.format(ecosystem=ecosystem)
+            print(f"[*] Downloading OSV data for {ecosystem}...")
+
+            try:
+                resp = httpx.get(url, timeout=300, follow_redirects=True)
+                resp.raise_for_status()
+            except (httpx.HTTPError, httpx.TimeoutException) as e:
+                print(f"[!] Failed to download {ecosystem}: {e}")
+                continue
+
+            try:
+                zf = zipfile.ZipFile(io.BytesIO(resp.content))
+            except zipfile.BadZipFile:
+                print(f"[!] Invalid zip file for {ecosystem}")
+                continue
+
+            # Clear existing data for this ecosystem
+            db.cursor.execute(
+                "DELETE FROM backports WHERE distro = ? AND release = ?",
+                [distro, release],
+            )
+
+            record_count = 0
+            batch = []
+            json_files = [n for n in zf.namelist() if n.endswith(".json")]
+
+            print(f"[+] Processing {len(json_files)} entries for {ecosystem}...")
+
+            for name in json_files:
+                try:
+                    entry = _json.loads(zf.read(name))
+                except (ValueError, KeyError):
+                    continue
+
+                # Collect CVE IDs from id + aliases
+                cve_ids = set()
+                entry_id = entry.get("id", "")
+                if entry_id.startswith("CVE-"):
+                    cve_ids.add(entry_id)
+                for alias in entry.get("aliases", []):
+                    if alias.startswith("CVE-"):
+                        cve_ids.add(alias)
+
+                if not cve_ids:
+                    continue
+
+                # Process affected packages
+                for affected in entry.get("affected", []):
+                    pkg = affected.get("package", {})
+                    pkg_ecosystem = pkg.get("ecosystem", "")
+                    pkg_name = pkg.get("name", "")
+                    if not pkg_name or pkg_ecosystem != ecosystem:
+                        continue
+
+                    # Extract fixed versions from ranges
+                    fixed_version = None
+                    status = "affected"
+                    for rng in affected.get("ranges", []):
+                        if rng.get("type") != "ECOSYSTEM":
+                            continue
+                        for event in rng.get("events", []):
+                            if "fixed" in event:
+                                fixed_version = event["fixed"]
+                                status = "fixed"
+
+                    for cve_id in cve_ids:
+                        batch.append((
+                            cve_id, distro, release, pkg_name,
+                            fixed_version, status,
+                        ))
+                        record_count += 1
+
+                # Flush in batches of 5000
+                if len(batch) >= 5000:
+                    db.cursor.executemany(
+                        "INSERT OR REPLACE INTO backports "
+                        "(cve_id, distro, release, package, fixed_version, status) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        batch,
+                    )
+                    db.conn.commit()
+                    batch = []
+
+            # Flush remaining
+            if batch:
+                db.cursor.executemany(
+                    "INSERT OR REPLACE INTO backports "
+                    "(cve_id, distro, release, package, fixed_version, status) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    batch,
+                )
+                db.conn.commit()
+
+            # Update metadata
+            db.cursor.execute(
+                "INSERT OR REPLACE INTO backport_metadata "
+                "(id, ecosystem, last_updated, record_count) "
+                "VALUES ("
+                "(SELECT id FROM backport_metadata WHERE ecosystem = ?), "
+                "?, ?, ?)",
+                [ecosystem, ecosystem, now(), record_count],
+            )
+            db.conn.commit()
+
+            print(f"[+] {ecosystem}: {record_count} backport records loaded")
+
+    print("[+] Backport data update complete")
 
 
 def _norm(string):
@@ -713,7 +874,8 @@ def update_exploitdb(args):
                             bar.update()
 
 
-def run_update(database, api_key, noscrape=False, full=False):
+def run_update(database, api_key, noscrape=False, full=False,
+               backports=False, backports_only=False, ecosystems=None):
     """Run the database create/update process.
 
     Args:
@@ -721,6 +883,9 @@ def run_update(database, api_key, noscrape=False, full=False):
         api_key: NVD API key string.
         noscrape: If True, skip ExploitDB name scraping.
         full: If True, force full rebuild (delete existing DB first).
+        backports: If True, also fetch OSV backport data after NVD update.
+        backports_only: If True, skip NVD update, only fetch backport data.
+        ecosystems: List of OSV ecosystem strings to fetch (e.g. ["Debian:12"]).
 
     Raises:
         DatabaseUpdateError: On any failure during the update process.
@@ -729,6 +894,16 @@ def run_update(database, api_key, noscrape=False, full=False):
     KEY = api_key
 
     database = Path(database)
+
+    if backports_only:
+        # Only update backport data, skip NVD
+        print(COPYRIGHT)
+        # Ensure tables exist
+        with Database(database) as db:
+            db.setup()
+        update_backports_osv(database, ecosystems=ecosystems)
+        return
+
     if full and database.is_file():
         database.unlink()
 
@@ -760,6 +935,9 @@ def run_update(database, api_key, noscrape=False, full=False):
             thread.join()
             bar.update()
 
+    if backports:
+        update_backports_osv(database, ecosystems=ecosystems)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -774,7 +952,25 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable exploit-db name scraping",
     )
+    parser.add_argument(
+        "--backports",
+        action="store_true",
+        help="Also fetch OSV backport data after NVD update",
+    )
+    parser.add_argument(
+        "--backports-only",
+        action="store_true",
+        help="Skip NVD update, only fetch OSV backport data",
+    )
+    parser.add_argument(
+        "--ecosystems",
+        help="Comma-separated OSV ecosystems (default: Debian:12,Debian:11,Ubuntu:22.04,Ubuntu:24.04)",
+    )
     args = parser.parse_args()
+
+    ecosystems = None
+    if args.ecosystems:
+        ecosystems = [e.strip() for e in args.ecosystems.split(",")]
 
     api = Path(".api")
     if api.is_file():
@@ -782,18 +978,23 @@ if __name__ == "__main__":
             api_key = f.read().strip()
     else:
         api_key = os.getenv("NVD_KEY")
-        if api_key is None:
+        if api_key is None and not args.backports_only:
             print(
                 "[!] NVD API key required in order to retrieve data. "
                 "Check README.md for more information"
             )
             sys.exit(1)
+        if api_key is None:
+            api_key = ""
 
     try:
         run_update(
             database=args.database,
             api_key=api_key,
             noscrape=args.noscrape,
+            backports=args.backports,
+            backports_only=args.backports_only,
+            ecosystems=ecosystems,
         )
     except DatabaseUpdateError as e:
         print(f"[!] {e}")

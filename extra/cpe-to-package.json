@@ -1,0 +1,229 @@
+{
+  "openbsd:openssh": {
+    "debian": "openssh",
+    "ubuntu": "openssh",
+    "alpine": "openssh"
+  },
+  "apache:http_server": {
+    "debian": "apache2",
+    "ubuntu": "apache2",
+    "alpine": "apache2"
+  },
+  "openssl:openssl": {
+    "debian": "openssl",
+    "ubuntu": "openssl",
+    "alpine": "openssl"
+  },
+  "isc:bind": {
+    "debian": "bind9",
+    "ubuntu": "bind9",
+    "alpine": "bind"
+  },
+  "nginx:nginx": {
+    "debian": "nginx",
+    "ubuntu": "nginx",
+    "alpine": "nginx"
+  },
+  "oracle:mysql": {
+    "debian": "mysql-8.0",
+    "ubuntu": "mysql-8.0"
+  },
+  "mariadb:mariadb": {
+    "debian": "mariadb",
+    "ubuntu": "mariadb"
+  },
+  "postgresql:postgresql": {
+    "debian": "postgresql-16",
+    "ubuntu": "postgresql-16"
+  },
+  "php:php": {
+    "debian": "php8.2",
+    "ubuntu": "php8.1",
+    "alpine": "php83"
+  },
+  "openbsd:libressl": {
+    "alpine": "libressl"
+  },
+  "haxx:curl": {
+    "debian": "curl",
+    "ubuntu": "curl",
+    "alpine": "curl"
+  },
+  "haxx:libcurl": {
+    "debian": "curl",
+    "ubuntu": "curl",
+    "alpine": "curl"
+  },
+  "gnu:gnutls": {
+    "debian": "gnutls28",
+    "ubuntu": "gnutls28"
+  },
+  "proftpd:proftpd": {
+    "debian": "proftpd-dfsg",
+    "ubuntu": "proftpd-dfsg"
+  },
+  "pureftpd:pure-ftpd": {
+    "debian": "pure-ftpd",
+    "ubuntu": "pure-ftpd"
+  },
+  "vsftpd:vsftpd": {
+    "debian": "vsftpd",
+    "ubuntu": "vsftpd"
+  },
+  "samba:samba": {
+    "debian": "samba",
+    "ubuntu": "samba",
+    "alpine": "samba"
+  },
+  "squid-cache:squid": {
+    "debian": "squid",
+    "ubuntu": "squid",
+    "alpine": "squid"
+  },
+  "postfix:postfix": {
+    "debian": "postfix",
+    "ubuntu": "postfix",
+    "alpine": "postfix"
+  },
+  "dovecot:dovecot": {
+    "debian": "dovecot",
+    "ubuntu": "dovecot",
+    "alpine": "dovecot"
+  },
+  "exim:exim": {
+    "debian": "exim4",
+    "ubuntu": "exim4"
+  },
+  "lighttpd:lighttpd": {
+    "debian": "lighttpd",
+    "ubuntu": "lighttpd",
+    "alpine": "lighttpd"
+  },
+  "varnish-software:varnish_cache": {
+    "debian": "varnish",
+    "ubuntu": "varnish"
+  },
+  "redis:redis": {
+    "debian": "redis",
+    "ubuntu": "redis",
+    "alpine": "redis"
+  },
+  "memcached:memcached": {
+    "debian": "memcached",
+    "ubuntu": "memcached",
+    "alpine": "memcached"
+  },
+  "mongodb:mongodb": {
+    "debian": "mongodb",
+    "ubuntu": "mongodb"
+  },
+  "sqlite:sqlite": {
+    "debian": "sqlite3",
+    "ubuntu": "sqlite3",
+    "alpine": "sqlite"
+  },
+  "gnu:wget": {
+    "debian": "wget",
+    "ubuntu": "wget",
+    "alpine": "wget"
+  },
+  "ntp:ntp": {
+    "debian": "ntp",
+    "ubuntu": "ntp",
+    "alpine": "ntp"
+  },
+  "isc:dhcp": {
+    "debian": "isc-dhcp",
+    "ubuntu": "isc-dhcp"
+  },
+  "openvpn:openvpn": {
+    "debian": "openvpn",
+    "ubuntu": "openvpn",
+    "alpine": "openvpn"
+  },
+  "strongswan:strongswan": {
+    "debian": "strongswan",
+    "ubuntu": "strongswan",
+    "alpine": "strongswan"
+  },
+  "wireshark:wireshark": {
+    "debian": "wireshark",
+    "ubuntu": "wireshark"
+  },
+  "snort:snort": {
+    "debian": "snort",
+    "ubuntu": "snort"
+  },
+  "cyrus:imap": {
+    "debian": "cyrus-imapd",
+    "ubuntu": "cyrus-imapd"
+  },
+  "asterisk:asterisk": {
+    "debian": "asterisk",
+    "ubuntu": "asterisk"
+  },
+  "gnu:bash": {
+    "debian": "bash",
+    "ubuntu": "bash",
+    "alpine": "bash"
+  },
+  "zlib:zlib": {
+    "debian": "zlib",
+    "ubuntu": "zlib",
+    "alpine": "zlib"
+  },
+  "libexpat_project:libexpat": {
+    "debian": "expat",
+    "ubuntu": "expat",
+    "alpine": "expat"
+  },
+  "xmlsoft:libxml2": {
+    "debian": "libxml2",
+    "ubuntu": "libxml2",
+    "alpine": "libxml2"
+  },
+  "xmlsoft:libxslt": {
+    "debian": "libxslt",
+    "ubuntu": "libxslt",
+    "alpine": "libxslt"
+  },
+  "imagemagick:imagemagick": {
+    "debian": "imagemagick",
+    "ubuntu": "imagemagick"
+  },
+  "libtiff:libtiff": {
+    "debian": "tiff",
+    "ubuntu": "tiff",
+    "alpine": "tiff"
+  },
+  "libpng:libpng": {
+    "debian": "libpng1.6",
+    "ubuntu": "libpng1.6",
+    "alpine": "libpng"
+  },
+  "git-scm:git": {
+    "debian": "git",
+    "ubuntu": "git",
+    "alpine": "git"
+  },
+  "nodejs:node.js": {
+    "debian": "nodejs",
+    "ubuntu": "nodejs",
+    "alpine": "nodejs"
+  },
+  "python:python": {
+    "debian": "python3.11",
+    "ubuntu": "python3.10",
+    "alpine": "python3"
+  },
+  "ruby-lang:ruby": {
+    "debian": "ruby3.1",
+    "ubuntu": "ruby3.0",
+    "alpine": "ruby"
+  },
+  "perl:perl": {
+    "debian": "perl",
+    "ubuntu": "perl",
+    "alpine": "perl"
+  }
+}

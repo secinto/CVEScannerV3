@@ -33,6 +33,9 @@ from pathlib import Path
 
 VERSION = "3.4"
 
+# Ensure extra/ is importable when running from project root
+sys.path.insert(0, str(Path(__file__).parent))
+
 
 # ---------------------------------------------------------------------------
 # Version parsing & comparison (ported from cvescannerv3.nse)
@@ -418,17 +421,196 @@ def resolve_aliases(product, aliases):
 
 
 # ---------------------------------------------------------------------------
+# Distro-aware backport detection
+# ---------------------------------------------------------------------------
+
+def _detect_distro(service):
+    """Detect distro info from service dict fields.
+
+    Checks explicit overrides first, then parses banner.
+    Returns (distro, distro_release) or (None, None).
+    """
+    distro = service.get("distro")
+    distro_release = service.get("distro_release")
+    if distro:
+        return distro, distro_release
+
+    banner = service.get("banner")
+    if banner:
+        from distro import detect_distro_from_banner
+        info = detect_distro_from_banner(banner)
+        if info:
+            return info["distro"], info.get("distro_release")
+
+    return None, None
+
+
+def _load_cpe_to_pkg(path):
+    """Load CPE-to-package mapping from JSON file."""
+    if path and Path(path).is_file():
+        with open(path) as f:
+            return json.load(f)
+    # Try default location
+    default = Path(__file__).parent / "cpe-to-package.json"
+    if default.is_file():
+        with open(default) as f:
+            return json.load(f)
+    return {}
+
+
+def _get_cpe_vendor_product(service):
+    """Extract vendor and product from service CPE or product field.
+
+    Returns (vendor, product) tuple.
+    """
+    if service.get("cpe"):
+        parts = service["cpe"].split(":")
+        vendor = parts[2] if len(parts) > 2 else None
+        product = parts[3] if len(parts) > 3 else None
+        return vendor, product
+    return None, service.get("product")
+
+
+def check_backports(cur, cve_ids, distro, distro_release, cpe_vendor,
+                    cpe_product, cpe_to_pkg, installed_version=None):
+    """Check backport database for patched CVEs.
+
+    Returns dict: {cve_id: {"status": "patched"|"affected"|"unknown",
+                             "fixed_version": str|None}}
+    """
+    from distro import get_osv_ecosystem_parts
+
+    osv_prefix, osv_release = get_osv_ecosystem_parts(distro, distro_release)
+    if not osv_prefix or not osv_release:
+        return {cve_id: {"status": "unknown", "fixed_version": None}
+                for cve_id in cve_ids}
+
+    # Look up distro package name
+    pkg_name = None
+    if cpe_vendor and cpe_product:
+        key = f"{cpe_vendor}:{cpe_product}"
+        mapping = cpe_to_pkg.get(key, {})
+        pkg_name = mapping.get(distro)
+
+    # Fallback: try all entries matching just the product name
+    if not pkg_name and cpe_product:
+        for map_key, map_val in cpe_to_pkg.items():
+            if map_key.endswith(f":{cpe_product}"):
+                pkg_name = map_val.get(distro)
+                if pkg_name:
+                    break
+
+    if not pkg_name:
+        return {cve_id: {"status": "unknown", "fixed_version": None}
+                for cve_id in cve_ids}
+
+    # Batch query backports table
+    if not cve_ids:
+        return {}
+
+    placeholders = ",".join("?" * len(cve_ids))
+    try:
+        cur.execute(
+            f"SELECT cve_id, fixed_version, status FROM backports "
+            f"WHERE cve_id IN ({placeholders}) "
+            f"AND distro = ? AND release = ? AND package = ?",
+            list(cve_ids) + [osv_prefix, osv_release, pkg_name],
+        )
+        rows = cur.fetchall()
+    except sql.OperationalError:
+        # Table might not exist in older databases
+        return {cve_id: {"status": "unknown", "fixed_version": None}
+                for cve_id in cve_ids}
+
+    backport_info = {}
+    for cve_id, fixed_version, status in rows:
+        if status == "fixed" and fixed_version:
+            # Compare installed version against fixed version
+            if installed_version:
+                from dpkg_version import compare_dpkg_versions
+                cmp = compare_dpkg_versions(installed_version, fixed_version)
+                if cmp >= 0:
+                    backport_info[cve_id] = {
+                        "status": "patched",
+                        "fixed_version": fixed_version,
+                    }
+                else:
+                    backport_info[cve_id] = {
+                        "status": "affected",
+                        "fixed_version": fixed_version,
+                    }
+            else:
+                # No installed version to compare; mark as patched
+                # since the distro has a fix available
+                backport_info[cve_id] = {
+                    "status": "patched",
+                    "fixed_version": fixed_version,
+                }
+        else:
+            backport_info[cve_id] = {
+                "status": "affected",
+                "fixed_version": None,
+            }
+
+    # Fill in unknown for CVEs not in backport DB
+    for cve_id in cve_ids:
+        if cve_id not in backport_info:
+            backport_info[cve_id] = {"status": "unknown", "fixed_version": None}
+
+    return backport_info
+
+
+def annotate_confidence(cve_list, distro, distro_release, backport_results):
+    """Annotate CVEs with confidence levels and split into active vs patched.
+
+    Returns (active_cves, patched_cves).
+    """
+    if not distro:
+        # No distro detected — all CVEs are upstream matches, no split
+        return cve_list, []
+
+    active = []
+    patched = []
+
+    for cve in cve_list:
+        cve_id = cve["cve_id"]
+        bp = backport_results.get(cve_id, {})
+        bp_status = bp.get("status", "unknown")
+        fixed_version = bp.get("fixed_version")
+
+        if bp_status == "patched":
+            cve["confidence"] = "LIKELY_PATCHED"
+            if fixed_version:
+                cve["fixed_version"] = fixed_version
+            patched.append(cve)
+        elif bp_status == "affected":
+            cve["confidence"] = "UPSTREAM_MATCH"
+            active.append(cve)
+        else:
+            # unknown — no backport data
+            cve["confidence"] = "UNCERTAIN"
+            active.append(cve)
+
+    return active, patched
+
+
+# ---------------------------------------------------------------------------
 # High-level scan orchestration
 # ---------------------------------------------------------------------------
 
-def scan_service(cur, service, aliases, maxcve, cache=None):
+def scan_service(cur, service, aliases, maxcve, cache=None,
+                 cpe_to_pkg=None, online=False):
     """Scan a single service entry and return a result dict.
 
     cache: optional dict shared across services to avoid re-querying the same
            product|version|vupdate combination.  Mirrors Lua registry.cache.
+    cpe_to_pkg: CPE-to-distro-package mapping dict.
+    online: if True, query OSV.dev API for uncertain CVEs.
     """
     if cache is None:
         cache = {}
+    if cpe_to_pkg is None:
+        cpe_to_pkg = {}
 
     # Resolve product and version info
     if service.get("cpe"):
@@ -455,6 +637,9 @@ def scan_service(cur, service, aliases, maxcve, cache=None):
     else:
         ver_display = version_info["ver"]
         vup_display = version_info["vup"]
+
+    # Detect distro
+    distro, distro_release = _detect_distro(service)
 
     # Query for all product name variants (original + aliases)
     all_products = resolve_aliases(product, aliases)
@@ -493,13 +678,78 @@ def scan_service(cur, service, aliases, maxcve, cache=None):
             cve_entry["metasploit"] = metasploits_by_cve[cve_id]
         cve_list.append(cve_entry)
 
+    # Backport detection when distro is known
+    backport_results = {}
+    if distro:
+        cpe_vendor, cpe_product = _get_cpe_vendor_product(service)
+        if not cpe_vendor and product:
+            # Try common vendor mappings
+            cpe_product = product
+        installed_version = service.get("installed_version")
+        backport_results = check_backports(
+            cur, cve_ids, distro, distro_release,
+            cpe_vendor, cpe_product, cpe_to_pkg,
+            installed_version=installed_version,
+        )
+
+        # Online enrichment for uncertain CVEs
+        if online:
+            uncertain_ids = [
+                cid for cid in cve_ids
+                if backport_results.get(cid, {}).get("status") == "unknown"
+            ]
+            if uncertain_ids:
+                try:
+                    from osv_client import enrich_from_osv
+                    from distro import get_osv_ecosystem_parts
+
+                    osv_prefix, osv_release = get_osv_ecosystem_parts(
+                        distro, distro_release
+                    )
+                    # Resolve package name for OSV
+                    pkg_name = None
+                    if cpe_vendor and cpe_product:
+                        key = f"{cpe_vendor}:{cpe_product}"
+                        mapping = cpe_to_pkg.get(key, {})
+                        pkg_name = mapping.get(distro)
+
+                    if pkg_name and installed_version:
+                        osv_results = enrich_from_osv(
+                            uncertain_ids, distro, distro_release,
+                            pkg_name, installed_version,
+                        )
+                        for cve_id, osv_status in osv_results.items():
+                            if osv_status == "not_affected":
+                                backport_results[cve_id] = {
+                                    "status": "patched",
+                                    "fixed_version": None,
+                                }
+                            elif osv_status == "affected":
+                                backport_results[cve_id] = {
+                                    "status": "affected",
+                                    "fixed_version": None,
+                                }
+                except ImportError:
+                    pass  # osv_client not available
+
+    # Annotate confidence and split
+    active_cves, patched_cves = annotate_confidence(
+        cve_list, distro, distro_release, backport_results,
+    )
+
     result = {
         "product": product,
         "version": ver_display,
         "version_update": vup_display,
         "total_cves": len(all_vulns),
-        "cves": cve_list,
+        "cves": active_cves,
     }
+    if distro:
+        result["distro"] = distro
+        if distro_release:
+            result["distro_release"] = distro_release
+    if patched_cves:
+        result["likely_patched"] = patched_cves
     if "id" in service:
         result["id"] = service["id"]
     if "cpe" in service:
@@ -507,17 +757,24 @@ def scan_service(cur, service, aliases, maxcve, cache=None):
     return result
 
 
-def run_scan(db_path, services, aliases=None, maxcve=0):
+def run_scan(db_path, services, aliases=None, maxcve=0,
+             cpe_to_pkg=None, online=False):
     """Run CVE scan for a list of service dicts.
 
     Returns the full output dict with metadata and results.
     """
+    if cpe_to_pkg is None:
+        cpe_to_pkg = _load_cpe_to_pkg(None)
+
     results = []
     cache = {}  # shared across all services (mirrors Lua registry.cache)
     with closing(sql.connect(db_path)) as conn:
         with closing(conn.cursor()) as cur:
             for service in services:
-                result = scan_service(cur, service, aliases, maxcve, cache)
+                result = scan_service(
+                    cur, service, aliases, maxcve, cache,
+                    cpe_to_pkg=cpe_to_pkg, online=online,
+                )
                 if result is not None:
                     results.append(result)
 
@@ -535,6 +792,25 @@ def run_scan(db_path, services, aliases=None, maxcve=0):
 # Output formatting
 # ---------------------------------------------------------------------------
 
+def _format_cve_row(cve):
+    """Format a single CVE entry as a table row string."""
+    v2 = f"{cve['cvss_v2']:.1f}" if cve["cvss_v2"] is not None else "-"
+    v3 = f"{cve['cvss_v3']:.1f}" if cve["cvss_v3"] is not None else "-"
+    edb = "Yes" if cve.get("exploitdb") else "No"
+    msf = "Yes" if cve.get("metasploit") else "No"
+    return f"  {cve['cve_id']:<20s} {v2:>6s} {v3:>6s} {edb:>9s} {msf:>10s}"
+
+
+def _format_cve_table_header():
+    """Return the CVE table header and separator."""
+    header = (
+        f"  {'CVE ID':<20s} {'CVSSv2':>6s} {'CVSSv3':>6s}"
+        f" {'ExploitDB':>9s} {'Metasploit':>10s}"
+    )
+    sep = "  " + "-" * 55
+    return header, sep
+
+
 def format_table(output):
     """Format scan output as a human-readable table."""
     lines = []
@@ -551,23 +827,35 @@ def format_table(output):
         if result["version_update"] != "*":
             header += result["version_update"]
         lines.append(header)
+
+        if result.get("distro"):
+            distro_str = result["distro"]
+            if result.get("distro_release"):
+                distro_str += f" ({result['distro_release']})"
+            lines.append(f"  Distro: {distro_str}")
+
         lines.append(f"  Total CVEs: {result['total_cves']}")
 
         if result["cves"]:
-            lines.append(
-                f"  {'CVE ID':<20s} {'CVSSv2':>6s} {'CVSSv3':>6s}"
-                f" {'ExploitDB':>9s} {'Metasploit':>10s}"
-            )
-            lines.append("  " + "-" * 55)
+            hdr, sep = _format_cve_table_header()
+            lines.append(hdr)
+            lines.append(sep)
             for cve in result["cves"]:
-                v2 = f"{cve['cvss_v2']:.1f}" if cve["cvss_v2"] is not None else "-"
-                v3 = f"{cve['cvss_v3']:.1f}" if cve["cvss_v3"] is not None else "-"
-                edb = "Yes" if cve.get("exploitdb") else "No"
-                msf = "Yes" if cve.get("metasploit") else "No"
-                lines.append(
-                    f"  {cve['cve_id']:<20s} {v2:>6s} {v3:>6s}"
-                    f" {edb:>9s} {msf:>10s}"
-                )
+                lines.append(_format_cve_row(cve))
+
+        if result.get("likely_patched"):
+            lines.append("")
+            lines.append("  Likely Patched:")
+            hdr, sep = _format_cve_table_header()
+            lines.append(hdr)
+            lines.append(sep)
+            for cve in result["likely_patched"]:
+                row = _format_cve_row(cve)
+                fv = cve.get("fixed_version", "")
+                if fv:
+                    row += f"  (fixed: {fv})"
+                lines.append(row)
+
         lines.append("")
 
     return "\n".join(lines)
@@ -609,12 +897,35 @@ def cmd_db_info(args):
             except sql.OperationalError:
                 exploits_named = 0
 
+    # Backport stats
+    backport_count = 0
+    backport_ecosystems = []
+    with closing(sql.connect(db_path)) as conn:
+        with closing(conn.cursor()) as cur:
+            try:
+                cur.execute("SELECT COUNT(*) FROM backports")
+                backport_count = cur.fetchone()[0]
+            except sql.OperationalError:
+                pass
+            try:
+                cur.execute(
+                    "SELECT ecosystem, record_count, last_updated "
+                    "FROM backport_metadata ORDER BY ecosystem"
+                )
+                backport_ecosystems = cur.fetchall()
+            except sql.OperationalError:
+                pass
+
     print(f"Database:     {db_path}")
     print(f"Last updated: {last_mod}")
     print(f"Products:     {counts['products']:,}")
     print(f"CVEs:         {counts['cves']:,}")
     print(f"Exploits:     {counts['exploits']:,} (with names: {exploits_named:,})")
     print(f"Metasploit:   {counts['metasploits']:,}")
+    if backport_count > 0:
+        print(f"Backports:    {backport_count:,}")
+        for eco, count, updated in backport_ecosystems:
+            print(f"  {eco}: {count:,} records (updated: {updated})")
 
 
 # ---------------------------------------------------------------------------
@@ -633,14 +944,23 @@ def cmd_update_db(args):
     """Create or update the CVE database."""
     # Resolve API key: --api-key > .api file > NVD_KEY env var
     import os
+
+    backports_only = getattr(args, "backports_only", False)
     api_key = args.api_key or _read_api_key_file() or os.getenv("NVD_KEY")
-    if not api_key:
+    if not api_key and not backports_only:
         print(
             "Error: NVD API key required. Provide via --api-key, "
             ".api file, or NVD_KEY environment variable.",
             file=sys.stderr,
         )
         sys.exit(1)
+    if not api_key:
+        api_key = ""
+
+    # Parse ecosystems
+    ecosystems = None
+    if getattr(args, "ecosystems", None):
+        ecosystems = [e.strip() for e in args.ecosystems.split(",")]
 
     # Import and delegate to database module
     try:
@@ -654,8 +974,11 @@ def cmd_update_db(args):
         run_update(
             database=Path(args.cve),
             api_key=api_key,
-            noscrape=args.no_scrape,
-            full=args.full,
+            noscrape=getattr(args, "no_scrape", False),
+            full=getattr(args, "full", False),
+            backports=getattr(args, "backports", False),
+            backports_only=backports_only,
+            ecosystems=ecosystems,
         )
     except Exception as e:
         print(f"Error updating database: {e}", file=sys.stderr)
@@ -678,6 +1001,9 @@ def cmd_scan(args):
     if args.aliases and Path(args.aliases).is_file():
         with open(args.aliases) as f:
             aliases = json.load(f)
+
+    # Load CPE-to-package mapping
+    cpe_to_pkg = _load_cpe_to_pkg(getattr(args, "cpe_to_pkg", None))
 
     # Build services list from input
     services = None
@@ -712,8 +1038,23 @@ def cmd_scan(args):
         print("Error: No services to scan.", file=sys.stderr)
         sys.exit(1)
 
+    # Propagate --distro/--distro-release overrides into each service
+    distro_override = getattr(args, "distro", None)
+    distro_release_override = getattr(args, "distro_release", None)
+    if distro_override:
+        for svc in services:
+            svc.setdefault("distro", distro_override)
+    if distro_release_override:
+        for svc in services:
+            svc.setdefault("distro_release", distro_release_override)
+
+    online = getattr(args, "online", False)
+
     # Run scan
-    output = run_scan(db_path, services, aliases=aliases, maxcve=args.maxcve)
+    output = run_scan(
+        db_path, services, aliases=aliases, maxcve=args.maxcve,
+        cpe_to_pkg=cpe_to_pkg, online=online,
+    )
 
     # Format output
     if args.format == "table":
@@ -791,6 +1132,23 @@ def main():
         "--format", choices=["json", "table"], default="json",
         help="Output format (default: json)",
     )
+    distro_group = scan_parser.add_argument_group("distro detection")
+    distro_group.add_argument(
+        "--distro",
+        help="Override distro for all services (e.g. debian, ubuntu, rhel)",
+    )
+    distro_group.add_argument(
+        "--distro-release",
+        help="Override distro release codename (e.g. bookworm, jammy)",
+    )
+    distro_group.add_argument(
+        "--cpe-to-pkg",
+        help="Path to CPE-to-package mapping JSON (default: extra/cpe-to-package.json)",
+    )
+    distro_group.add_argument(
+        "--online", action="store_true",
+        help="Query OSV.dev API for uncertain CVEs (requires network)",
+    )
 
     # -- update-db subcommand --
     update_parser = subparsers.add_parser(
@@ -808,6 +1166,19 @@ def main():
     update_parser.add_argument(
         "--full", action="store_true",
         help="Force full database rebuild",
+    )
+    update_parser.add_argument(
+        "--backports", action="store_true",
+        help="Also fetch OSV backport data after NVD update",
+    )
+    update_parser.add_argument(
+        "--backports-only", action="store_true",
+        help="Skip NVD update, only fetch OSV backport data",
+    )
+    update_parser.add_argument(
+        "--ecosystems",
+        help="Comma-separated OSV ecosystems "
+             "(default: Debian:12,Debian:11,Ubuntu:22.04,Ubuntu:24.04)",
     )
 
     # -- db-info subcommand --

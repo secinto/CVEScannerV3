@@ -15,6 +15,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from cvescan import (
+    _detect_distro,
+    _load_cpe_to_pkg,
+    annotate_confidence,
+    check_backports,
     compare_version,
     find_vulnerabilities,
     format_table,
@@ -28,6 +32,14 @@ from cvescan import (
     run_scan,
     scan_service,
 )
+from distro import (
+    detect_debian_release,
+    detect_distro_from_banner,
+    detect_ubuntu_release,
+    get_osv_ecosystem,
+    get_osv_ecosystem_parts,
+)
+from dpkg_version import compare_dpkg_versions, parse_dpkg_version
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +128,28 @@ SCHEMA = """
         ON affected(product_id);
     CREATE INDEX IF NOT EXISTS idx_multiaffected_product
         ON multiaffected(product_id);
+
+    CREATE TABLE IF NOT EXISTS backports (
+        cve_id TEXT NOT NULL,
+        distro TEXT NOT NULL,
+        release TEXT NOT NULL,
+        package TEXT NOT NULL,
+        fixed_version TEXT,
+        status TEXT NOT NULL,
+        UNIQUE (cve_id, distro, release, package)
+    );
+
+    CREATE TABLE IF NOT EXISTS backport_metadata (
+        id INTEGER PRIMARY KEY,
+        ecosystem TEXT NOT NULL UNIQUE,
+        last_updated TEXT,
+        record_count INTEGER
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_backports_cve
+        ON backports(cve_id);
+    CREATE INDEX IF NOT EXISTS idx_backports_package_release
+        ON backports(package, distro, release);
 """
 
 
@@ -212,6 +246,27 @@ def create_test_db(path=None):
     # Insert metasploit
     conn.execute("INSERT OR IGNORE INTO metasploits VALUES (1, 'exploit/multi/ssh/sshexec')")
     conn.execute("INSERT OR IGNORE INTO referenced_metasploit VALUES ('CVE-2016-1908', 1)")
+
+    # Insert backport data
+    backports = [
+        # CVE-2020-1234 fixed in Debian 12 openssh at version 1:4.7p1-2+deb12u3
+        ("CVE-2020-1234", "Debian", "12", "openssh", "1:4.7p1-2+deb12u3", "fixed"),
+        # CVE-2018-15473 fixed in Debian 12 openssh at version 1:4.7p1-2+deb12u1
+        ("CVE-2018-15473", "Debian", "12", "openssh", "1:4.7p1-2+deb12u1", "fixed"),
+        # CVE-2016-1908 still affected (no fix)
+        ("CVE-2016-1908", "Debian", "12", "openssh", None, "affected"),
+        # CVE-2023-1111 fixed in Debian 12 nginx
+        ("CVE-2023-1111", "Debian", "12", "nginx", "1.22.1-9+deb12u1", "fixed"),
+    ]
+    conn.executemany(
+        "INSERT OR REPLACE INTO backports "
+        "(cve_id, distro, release, package, fixed_version, status) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        backports,
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO backport_metadata VALUES (1, 'Debian:12', '2026-01-01T00:00:00', 4)"
+    )
 
     conn.commit()
     return conn
@@ -771,6 +826,476 @@ class TestCLI(unittest.TestCase):
             capture_output=True, text=True,
         )
         self.assertNotEqual(result.returncode, 0)
+
+
+# ---------------------------------------------------------------------------
+# Tests: Distro detection
+# ---------------------------------------------------------------------------
+
+class TestDistroDetection(unittest.TestCase):
+    def test_debian_ssh_banner(self):
+        banner = "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u7"
+        info = detect_distro_from_banner(banner)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["distro"], "debian")
+        self.assertEqual(info["distro_release"], "bookworm")
+        self.assertEqual(info["package_revision"], "2+deb12u7")
+
+    def test_ubuntu_ssh_banner(self):
+        banner = "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.10"
+        info = detect_distro_from_banner(banner)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["distro"], "ubuntu")
+
+    def test_rhel_http_banner(self):
+        banner = "Apache/2.4.37 (Red Hat Enterprise Linux)"
+        info = detect_distro_from_banner(banner)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["distro"], "rhel")
+
+    def test_debian_http_banner(self):
+        banner = "Apache/2.4.57 (Debian)"
+        info = detect_distro_from_banner(banner)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["distro"], "debian")
+
+    def test_ubuntu_http_banner(self):
+        banner = "Apache/2.4.52 (Ubuntu)"
+        info = detect_distro_from_banner(banner)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["distro"], "ubuntu")
+
+    def test_bare_banner(self):
+        info = detect_distro_from_banner("OpenSSH_9.2p1")
+        self.assertIsNone(info)
+
+    def test_empty_banner(self):
+        self.assertIsNone(detect_distro_from_banner(""))
+        self.assertIsNone(detect_distro_from_banner(None))
+
+
+class TestDebianRelease(unittest.TestCase):
+    def test_deb12(self):
+        self.assertEqual(detect_debian_release("2+deb12u7"), "bookworm")
+
+    def test_deb11(self):
+        self.assertEqual(detect_debian_release("1+deb11u3"), "bullseye")
+
+    def test_deb10(self):
+        self.assertEqual(detect_debian_release("1+deb10u1"), "buster")
+
+    def test_unknown(self):
+        self.assertIsNone(detect_debian_release("3ubuntu0.10"))
+
+
+class TestOsvEcosystem(unittest.TestCase):
+    def test_debian_bookworm(self):
+        self.assertEqual(get_osv_ecosystem("debian", "bookworm"), "Debian:12")
+
+    def test_ubuntu_jammy(self):
+        self.assertEqual(get_osv_ecosystem("ubuntu", "jammy"), "Ubuntu:22.04")
+
+    def test_unknown(self):
+        self.assertIsNone(get_osv_ecosystem("debian", "unknown"))
+        self.assertIsNone(get_osv_ecosystem(None, None))
+
+    def test_parts(self):
+        prefix, release = get_osv_ecosystem_parts("debian", "bookworm")
+        self.assertEqual(prefix, "Debian")
+        self.assertEqual(release, "12")
+
+
+class TestDetectDistroService(unittest.TestCase):
+    def test_explicit_override(self):
+        svc = {"product": "openssh", "distro": "debian", "distro_release": "bookworm"}
+        d, r = _detect_distro(svc)
+        self.assertEqual(d, "debian")
+        self.assertEqual(r, "bookworm")
+
+    def test_from_banner(self):
+        svc = {"product": "openssh", "banner": "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u7"}
+        d, r = _detect_distro(svc)
+        self.assertEqual(d, "debian")
+        self.assertEqual(r, "bookworm")
+
+    def test_no_distro(self):
+        svc = {"product": "openssh"}
+        d, r = _detect_distro(svc)
+        self.assertIsNone(d)
+        self.assertIsNone(r)
+
+
+# ---------------------------------------------------------------------------
+# Tests: dpkg version comparison
+# ---------------------------------------------------------------------------
+
+class TestDpkgVersionParse(unittest.TestCase):
+    def test_simple(self):
+        self.assertEqual(parse_dpkg_version("1.0"), (0, "1.0", "0"))
+
+    def test_with_epoch(self):
+        self.assertEqual(parse_dpkg_version("1:9.2p1-2+deb12u7"),
+                         (1, "9.2p1", "2+deb12u7"))
+
+    def test_no_revision(self):
+        self.assertEqual(parse_dpkg_version("2:1.0"), (2, "1.0", "0"))
+
+    def test_multiple_hyphens(self):
+        self.assertEqual(parse_dpkg_version("1.0-beta-2"),
+                         (0, "1.0-beta", "2"))
+
+    def test_empty(self):
+        self.assertEqual(parse_dpkg_version(""), (0, "0", "0"))
+        self.assertEqual(parse_dpkg_version(None), (0, "0", "0"))
+
+
+class TestDpkgVersionCompare(unittest.TestCase):
+    def test_equal(self):
+        self.assertEqual(compare_dpkg_versions("1.0", "1.0"), 0)
+
+    def test_epoch_wins(self):
+        self.assertEqual(compare_dpkg_versions("2:1.0", "1:2.0"), 1)
+        self.assertEqual(compare_dpkg_versions("1:1.0", "2:1.0"), -1)
+
+    def test_upstream_compare(self):
+        self.assertEqual(compare_dpkg_versions("1.1", "1.0"), 1)
+        self.assertEqual(compare_dpkg_versions("1.0", "1.1"), -1)
+
+    def test_revision_compare(self):
+        self.assertEqual(compare_dpkg_versions("1.0-2", "1.0-1"), 1)
+        self.assertEqual(compare_dpkg_versions("1.0-1", "1.0-2"), -1)
+
+    def test_tilde_sorts_before_empty(self):
+        self.assertEqual(compare_dpkg_versions("1.0~rc1", "1.0"), -1)
+        self.assertEqual(compare_dpkg_versions("1.0", "1.0~rc1"), 1)
+
+    def test_tilde_ordering(self):
+        self.assertEqual(compare_dpkg_versions("1.0~alpha", "1.0~beta"), -1)
+
+    def test_deb_versions(self):
+        # Real Debian version comparison
+        self.assertEqual(
+            compare_dpkg_versions("1:9.2p1-2+deb12u3", "1:9.2p1-2+deb12u7"),
+            -1
+        )
+        self.assertEqual(
+            compare_dpkg_versions("1:9.2p1-2+deb12u7", "1:9.2p1-2+deb12u3"),
+            1
+        )
+
+    def test_same_version(self):
+        self.assertEqual(
+            compare_dpkg_versions("1:9.2p1-2+deb12u7", "1:9.2p1-2+deb12u7"),
+            0
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Backport checking
+# ---------------------------------------------------------------------------
+
+class TestCheckBackports(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.conn = create_test_db()
+        cls.cur = cls.conn.cursor()
+        cls.cpe_to_pkg = {"openbsd:openssh": {"debian": "openssh"}}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.cur.close()
+        cls.conn.close()
+
+    def test_patched_cve(self):
+        """CVE with a fixed version where installed >= fixed should be patched."""
+        result = check_backports(
+            self.cur,
+            ["CVE-2020-1234"],
+            "debian", "bookworm",
+            "openbsd", "openssh",
+            self.cpe_to_pkg,
+            installed_version="1:4.7p1-2+deb12u7",
+        )
+        self.assertEqual(result["CVE-2020-1234"]["status"], "patched")
+        self.assertEqual(result["CVE-2020-1234"]["fixed_version"], "1:4.7p1-2+deb12u3")
+
+    def test_affected_cve(self):
+        """CVE marked as affected (no fix) should be affected."""
+        result = check_backports(
+            self.cur,
+            ["CVE-2016-1908"],
+            "debian", "bookworm",
+            "openbsd", "openssh",
+            self.cpe_to_pkg,
+        )
+        self.assertEqual(result["CVE-2016-1908"]["status"], "affected")
+
+    def test_unknown_cve(self):
+        """CVE not in backport DB should be unknown."""
+        result = check_backports(
+            self.cur,
+            ["CVE-9999-0001"],
+            "debian", "bookworm",
+            "openbsd", "openssh",
+            self.cpe_to_pkg,
+        )
+        self.assertEqual(result["CVE-9999-0001"]["status"], "unknown")
+
+    def test_no_distro(self):
+        """Without distro ecosystem mapping, all should be unknown."""
+        result = check_backports(
+            self.cur,
+            ["CVE-2020-1234"],
+            "debian", "unknown_release",
+            "openbsd", "openssh",
+            self.cpe_to_pkg,
+        )
+        self.assertEqual(result["CVE-2020-1234"]["status"], "unknown")
+
+    def test_no_package_mapping(self):
+        """Without package mapping, all should be unknown."""
+        result = check_backports(
+            self.cur,
+            ["CVE-2020-1234"],
+            "debian", "bookworm",
+            "unknown", "unknown_product",
+            self.cpe_to_pkg,
+        )
+        self.assertEqual(result["CVE-2020-1234"]["status"], "unknown")
+
+
+# ---------------------------------------------------------------------------
+# Tests: Confidence annotation
+# ---------------------------------------------------------------------------
+
+class TestAnnotateConfidence(unittest.TestCase):
+    def test_no_distro_no_annotation(self):
+        """Without distro, all CVEs stay in active list without confidence key."""
+        cves = [{"cve_id": "CVE-1", "cvss_v3": 8.0, "cvss_v2": None}]
+        active, patched = annotate_confidence(cves, None, None, {})
+        self.assertEqual(len(active), 1)
+        self.assertEqual(len(patched), 0)
+        # No confidence key added when no distro
+        self.assertNotIn("confidence", active[0])
+
+    def test_patched_split(self):
+        """Patched CVEs should move to patched list."""
+        cves = [
+            {"cve_id": "CVE-1", "cvss_v3": 8.0, "cvss_v2": None},
+            {"cve_id": "CVE-2", "cvss_v3": 5.0, "cvss_v2": None},
+        ]
+        bp = {
+            "CVE-1": {"status": "patched", "fixed_version": "1.0-1"},
+            "CVE-2": {"status": "affected", "fixed_version": None},
+        }
+        active, patched = annotate_confidence(cves, "debian", "bookworm", bp)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["cve_id"], "CVE-2")
+        self.assertEqual(active[0]["confidence"], "UPSTREAM_MATCH")
+        self.assertEqual(len(patched), 1)
+        self.assertEqual(patched[0]["cve_id"], "CVE-1")
+        self.assertEqual(patched[0]["confidence"], "LIKELY_PATCHED")
+        self.assertEqual(patched[0]["fixed_version"], "1.0-1")
+
+    def test_uncertain(self):
+        """Unknown backport status should result in UNCERTAIN."""
+        cves = [{"cve_id": "CVE-1", "cvss_v3": 8.0, "cvss_v2": None}]
+        bp = {"CVE-1": {"status": "unknown", "fixed_version": None}}
+        active, patched = annotate_confidence(cves, "debian", "bookworm", bp)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["confidence"], "UNCERTAIN")
+        self.assertEqual(len(patched), 0)
+
+
+# ---------------------------------------------------------------------------
+# Tests: Scan with distro (integration)
+# ---------------------------------------------------------------------------
+
+class TestScanServiceWithDistro(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.conn = create_test_db()
+        cls.cur = cls.conn.cursor()
+        cls.cpe_to_pkg = {"openbsd:openssh": {"debian": "openssh"}}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.cur.close()
+        cls.conn.close()
+
+    def test_scan_without_distro_unchanged(self):
+        """Without distro fields, output should be identical to original format."""
+        result = scan_service(
+            self.cur,
+            {"product": "openssh", "version": "4.7", "version_update": "p1"},
+            aliases=None, maxcve=0,
+        )
+        self.assertNotIn("distro", result)
+        self.assertNotIn("likely_patched", result)
+        self.assertNotIn("confidence", result["cves"][0])
+
+    def test_scan_with_distro(self):
+        """With distro fields, output should have distro info and confidence."""
+        result = scan_service(
+            self.cur,
+            {
+                "product": "openssh", "version": "4.7", "version_update": "p1",
+                "distro": "debian", "distro_release": "bookworm",
+                "installed_version": "1:4.7p1-2+deb12u7",
+            },
+            aliases=None, maxcve=0,
+            cpe_to_pkg=self.cpe_to_pkg,
+        )
+        self.assertEqual(result["distro"], "debian")
+        self.assertEqual(result["distro_release"], "bookworm")
+        # Should have some CVEs split
+        all_cve_ids = {c["cve_id"] for c in result["cves"]}
+        patched_ids = {c["cve_id"] for c in result.get("likely_patched", [])}
+        # CVE-2020-1234 should be patched (fixed_version exists, installed >= fixed)
+        self.assertIn("CVE-2020-1234", patched_ids)
+        # CVE-2016-1908 is marked affected in backport DB, should stay active
+        self.assertIn("CVE-2016-1908", all_cve_ids)
+
+    def test_scan_with_banner(self):
+        """Banner should trigger distro detection."""
+        result = scan_service(
+            self.cur,
+            {
+                "product": "openssh", "version": "4.7",
+                "banner": "SSH-2.0-OpenSSH_4.7p1 Debian-2+deb12u7",
+            },
+            aliases=None, maxcve=0,
+            cpe_to_pkg=self.cpe_to_pkg,
+        )
+        self.assertEqual(result.get("distro"), "debian")
+        self.assertEqual(result.get("distro_release"), "bookworm")
+
+
+class TestRunScanWithDistro(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = Path(self.tmpdir) / "test.db"
+        self.conn = create_test_db(self.db_path)
+        self.conn.close()
+
+    def test_full_scan_with_distro(self):
+        cpe_to_pkg = {"openbsd:openssh": {"debian": "openssh"}}
+        services = [
+            {
+                "id": "ssh",
+                "product": "openssh", "version": "4.7",
+                "distro": "debian", "distro_release": "bookworm",
+            },
+        ]
+        output = run_scan(
+            str(self.db_path), services,
+            cpe_to_pkg=cpe_to_pkg,
+        )
+        result = output["results"][0]
+        self.assertEqual(result["distro"], "debian")
+
+    def test_full_scan_backward_compat(self):
+        """Without distro, output should be unchanged."""
+        services = [
+            {"id": "ssh", "product": "openssh", "version": "4.7"},
+        ]
+        output = run_scan(str(self.db_path), services)
+        result = output["results"][0]
+        self.assertNotIn("distro", result)
+        self.assertNotIn("likely_patched", result)
+
+
+# ---------------------------------------------------------------------------
+# Tests: Format table with distro
+# ---------------------------------------------------------------------------
+
+class TestFormatTableWithDistro(unittest.TestCase):
+    def test_table_with_patched(self):
+        output = {
+            "metadata": {
+                "timestamp": "2026-01-01T00:00:00+00:00",
+                "database": "test.db",
+                "version": "3.4",
+            },
+            "results": [
+                {
+                    "product": "openssh",
+                    "version": "9.2",
+                    "version_update": "*",
+                    "distro": "debian",
+                    "distro_release": "bookworm",
+                    "total_cves": 2,
+                    "cves": [
+                        {"cve_id": "CVE-2024-6387", "cvss_v2": None, "cvss_v3": 8.1,
+                         "confidence": "UPSTREAM_MATCH"},
+                    ],
+                    "likely_patched": [
+                        {"cve_id": "CVE-2023-48795", "cvss_v2": None, "cvss_v3": 5.9,
+                         "confidence": "LIKELY_PATCHED",
+                         "fixed_version": "1:9.2p1-2+deb12u3"},
+                    ],
+                }
+            ],
+        }
+        text = format_table(output)
+        self.assertIn("Distro: debian (bookworm)", text)
+        self.assertIn("Likely Patched:", text)
+        self.assertIn("CVE-2024-6387", text)
+        self.assertIn("CVE-2023-48795", text)
+        self.assertIn("fixed: 1:9.2p1-2+deb12u3", text)
+
+
+# ---------------------------------------------------------------------------
+# Tests: CLI with distro args
+# ---------------------------------------------------------------------------
+
+class TestCLIDistro(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = Path(self.tmpdir) / "test.db"
+        self.conn = create_test_db(self.db_path)
+        self.conn.close()
+        self.cvescan = str(Path(__file__).parent / "cvescan.py")
+
+    def test_scan_with_distro_args(self):
+        result = subprocess.run(
+            [sys.executable, self.cvescan, "scan",
+             "-c", str(self.db_path),
+             "-p", "openssh", "-v", "4.7",
+             "--distro", "debian", "--distro-release", "bookworm",
+             "-a", "/nonexistent"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        r = output["results"][0]
+        self.assertEqual(r["distro"], "debian")
+        self.assertEqual(r["distro_release"], "bookworm")
+
+    def test_scan_without_distro_backward_compat(self):
+        """Without --distro, output should match original format."""
+        result = subprocess.run(
+            [sys.executable, self.cvescan, "scan",
+             "-c", str(self.db_path),
+             "-p", "openssh", "-v", "4.7",
+             "-a", "/nonexistent"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        r = output["results"][0]
+        self.assertNotIn("distro", r)
+        self.assertNotIn("likely_patched", r)
+
+    def test_db_info_with_backports(self):
+        result = subprocess.run(
+            [sys.executable, self.cvescan, "db-info",
+             "-c", str(self.db_path)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Backports:", result.stdout)
+        self.assertIn("Debian:12", result.stdout)
 
 
 if __name__ == "__main__":
