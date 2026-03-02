@@ -1,107 +1,135 @@
-# Description
-Nmap script that provides information about probable vulnerabilities based on discovered services.
+# CVEScannerV3
+
+Nmap script and standalone Python CLI that provides information about probable
+vulnerabilities based on discovered services.
 
 **Contents:**
-  - [Technical details](#technical-details)
+  - [Features](#features)
   - [Requirements](#requirements)
       - [Optional](#optional)
-  - [Execution](#execution)
+  - [Nmap scanner](#nmap-scanner)
+      - [Script arguments](#script-arguments)
       - [Output](#output)
+  - [Standalone scanner](#standalone-scanner)
+      - [Scanning for CVEs](#scanning-for-cves)
+      - [Database management](#database-management)
+      - [Database info](#database-info)
+  - [Backport detection](#backport-detection)
+  - [Docker container](#docker-container)
   - [Errors and fixes](#errors-and-fixes)
     - [Blocked IP](#blocked-ip)
     - [Missing luasql](#missing-luasql)
-  - [Docker container](#docker-container)
-  - [Query database](#query-database)
   - [Acknowledgements](#acknowledgements)
   - [License](#license)
 
 
-# Technical details
-The current implementation take care of the following cases:
+# Features
 
-- If Nmap detects:
-  - `cpe` **AND** `version`: vulnerabilities affecting `version` and
-    vulnerabilities affecting a range of versions that include `version`.
-  - `cpe` **AND** `version range`: vulnerabilities affecting versions
-    between `version range` (included).
-  - `cpe` but **NO** `version`: vulnerabilities that affect
-    every version of the product.
-  - If no vulnerabilities were found with `cpe` and `version`
-    returned from Nmap, HTTP detection is used.
-  - **NO** `cpe`: HTTP detection is used.
-
-- HTTP detection:
-  - Used only if port matches **HTTP**/**SSL**/**UPnP**.
-  - An HTTP GET request is sent for every combination of _path_
-    and _extension_ in `extra/http-paths-vulnerscom.json`, comparing
-    the request headers/body with the regexes in
-    `extra/http-regex-vulnerscom.json`.
-  - Finally, the _home_ page html is analyzed in search for library paths.
-    The script tries to obtain the name and version from library location;
-    then does an HTTP GET to that path in order to inspect the code
-    of the library and analyze the starting commenot looking for the version.
-
-> Nmap library shortport is used to detect if port matches HTTP/SSL.
+- **Nmap NSE integration** — runs as `nmap --script cvescannerv3` to scan
+  discovered services against a local CVE database.
+- **Standalone Python CLI** (`extra/cvescan.py`) — scan products for CVEs
+  without Nmap, manage the database, and view statistics.
+- **Smart HTTP fingerprinting** — 3-phase detection using headers, cookies,
+  meta-generator tags, and JS library analysis (5-15 requests per port instead
+  of 190+).
+- **Distro-aware backport detection** — automatically detects Debian/Ubuntu
+  from SSH/HTTP banners and filters out CVEs that have been patched by the
+  distribution, reducing false positives.
+- **Batch SQL queries** — optimized database lookups (2 queries per product
+  instead of 3*N per CVE).
+- **ExploitDB and Metasploit** cross-referencing for every CVE found.
 
 # Requirements
-In order to run **cvescannerv3** script, you need the following files present
-in your working directory
+
+**For the Nmap scanner**, you need:
+- `lua-sql-sqlite3` (Ubuntu/Debian) or `lua5.4-sql-sqlite3` (Alpine)
 - CVE database: `cve.db`
-- Paths file: `extra/http-paths-vulnerscom.json`
-- Regex file: `extra/http-regex-vulnerscom.json`
-- Product-aliases file: `extra/product-aliases.json`
+- Data files in `extra/`:
+  - `http-paths-vulnerscom.json` — HTTP probe paths
+  - `http-regex-vulnerscom.json` — HTTP fingerprint regexes
+  - `product-aliases.json` — CPE product alias mappings
 
-In addition, you must have installed `lua-sql-sqlite3` (ubuntu)
-or `lua5.4-sql-sqlite3` (alpine) packages
-
-## Optional
-If you don't have the database `cve.db`, you can build it
-using the script `extra/database.py` or download a (semiupdated) copy
-from [CVEScannerV3DB](https://github.com/scmanjarrez/CVEScannerV3DB) using `.sql` files
-or under Actions->Latest->Summary->Artifacts
-
-> This repository is updated every two weeks
+**For the standalone scanner** (`extra/cvescan.py`), you need:
+- Python 3.8+
+- Dependencies from `extra/requirements.txt`
 
 ```bash
+pip install -r extra/requirements.txt
+```
+
+## Optional
+
+If you don't have the database `cve.db`, you can build it using the standalone
+CLI, using `extra/database.py` directly, or download a (semi-updated) copy from
+[CVEScannerV3DB](https://github.com/scmanjarrez/CVEScannerV3DB) using `.sql`
+files or under Actions->Latest->Summary->Artifacts.
+
+> This repository is updated every two weeks.
+
+```bash
+# Using the standalone CLI
+pip install -r extra/requirements.txt
+python extra/cvescan.py update-db --api-key YOUR_NVD_KEY
+```
+
+```bash
+# Using database.py directly
 pip install -r extra/requirements.txt
 python extra/database.py
 ```
 
 ```bash
+# Using pre-built database
 git clone https://github.com/scmanjarrez/CVEScannerV3DB
 cd CVEScannerV3DB && sh build.sh
 ```
 
-> **Note:** In order to execute `extra/database.py`, you need to
-> [request an API key](https://nvd.nist.gov/developers/request-an-api-key)
-> and save it to a file named `.api` on your current working directory
-> or in the environment variable `NVD_KEY`.
+> **Note:** Building from NVD requires an
+> [API key](https://nvd.nist.gov/developers/request-an-api-key).
+> Save it to a file named `.api` in your working directory, set the `NVD_KEY`
+> environment variable, or pass `--api-key` to the CLI.
 
-# Execution
-To run the script, use the following syntax
+
+# Nmap scanner
+
+The NSE script detects vulnerabilities for each open port based on:
+
+- **CPE + version**: CVEs affecting the exact version and version ranges
+  that include it.
+- **CPE + version range**: CVEs affecting versions within the range.
+- **CPE, no version**: all CVEs for the product.
+- **No CPE / no results**: falls back to HTTP fingerprinting (for
+  HTTP/SSL/UPnP ports).
+
+HTTP fingerprinting uses a 3-phase approach:
+1. **Phase 1** — GET `/`: scans response headers, cookies, body regexes,
+   `<meta name="generator">` tags, and inline JS library references.
+2. **Phase 2** (fallback) — probes a short list of common paths
+   (`/index.html`, `/index.php`, `/index.jsp`, `/default.aspx`, `/admin`).
+3. **Phase 3** (targeted) — for detected products, probes known version
+   endpoints (e.g., Jenkins `/api/json`, WordPress `/feed/`,
+   Grafana `/api/health`, Tomcat root page).
+
 ```
 nmap -sV --script cvescannerv3 <TARGET>
 nmap -sV --script cvescannerv3 --script-args log=logfile.log,json=logfile.json <TARGET>
 ```
 
-It is possible to modify the behaviour to some extent using the
-following arguments: db, maxcve, http, maxredirect, log, json,
-path, regex, aliases, service and version.
-<details>
-    <summary><b>script-args default values</b></summary>
+## Script arguments
 
-    db: cve.db
-    maxcve: 10
-    http: 1
-    maxredirect: 1
-    log: cvescannerv3.log
-    json: cvescannerv3.json
-    path: extra/http-paths-vulnerscom.json
-    regex: extra/http-regex-vulnerscom.json
-    aliases: extra/product-aliases.json
-    service: all
-    version: all
-</details>
+| Argument | Default | Description |
+|---|---|---|
+| `db` | `cve.db` | CVE database file path |
+| `maxcve` | `10` | Max CVEs printed on screen |
+| `http` | `1` | Enable/disable HTTP detection (`0` or `1`) |
+| `maxredirect` | `1` | Max HTTP redirects to follow |
+| `log` | `cvescannerv3.log` | Log file path |
+| `json` | `cvescannerv3.json` | JSON output file path |
+| `path` | `extra/http-paths-vulnerscom.json` | HTTP probe paths file |
+| `regex` | `extra/http-regex-vulnerscom.json` | HTTP fingerprint regex file |
+| `aliases` | `extra/product-aliases.json` | Product alias mappings |
+| `service` | `all` | Filter to a specific service name |
+| `version` | `all` | Filter to a specific version |
 
 <details>
     <summary><b>script-args examples</b></summary>
@@ -280,29 +308,145 @@ Log file **\*.json** contains the same information but formatted as **json**
 
 > You can find the full output of **metasploitable2/3** in `example_data`.
 
-# Errors and fixes
-## Blocked IP
-> Connection timeout/error during CRAWL phase (`database.py`)
 
-**Fix:** Wait 15 minutes before re-running `database.py`.
+# Standalone scanner
 
-## Missing luasql
-> cvescannerv3.nse:54: module 'luasql.sqlite3' not found:<br>
-> NSE failed to find nselib/luasql/sqlite3.lua in search paths.<br>
-> ...
-
-**Fix:** Install the library based on your OS (check [Requirements](#requirements))
-and create a symlink to Nmap search path.
-```bash
-apt install lua-sql-sqlite3
-ln -s /usr/lib/x86_64-linux-gnu/lua /usr/local/lib/lua
-```
+The standalone Python CLI (`extra/cvescan.py`) provides CVE scanning, database
+management, and statistics without requiring Nmap.
 
 ```bash
-apk add --no-cache lua5.4-sql-sqlite3
-ln -s /usr/lib/lua /usr/local/lib/lua
+python extra/cvescan.py --help
 ```
-> Above commands may require super user permissions.
+
+## Scanning for CVEs
+
+Three input modes are supported:
+
+```bash
+# Single product
+python extra/cvescan.py scan -p openssh -v 4.7 -u p1
+
+# CPE string
+python extra/cvescan.py scan --cpe cpe:/a:openbsd:openssh:4.7p1
+
+# JSON file with multiple services
+python extra/cvescan.py scan -i services.json
+
+# Pipe from stdin
+cat services.json | python extra/cvescan.py scan -i -
+```
+
+<details>
+    <summary><b>Input JSON format</b></summary>
+
+```json
+{
+  "services": [
+    {"id": "ssh-22", "cpe": "cpe:/a:openbsd:openssh:4.7p1"},
+    {"id": "http-80", "product": "nginx", "version": "1.26.3"},
+    {"id": "db-3306", "product": "mysql", "version": "5.5.55"},
+    {"id": "smb-445", "product": "samba", "version": "3.x - 4.x"}
+  ]
+}
+```
+</details>
+
+Output options:
+
+```bash
+# JSON output (default)
+python extra/cvescan.py scan -p openssh -v 4.7
+
+# Table output
+python extra/cvescan.py scan -p openssh -v 4.7 --format table
+
+# Write to file
+python extra/cvescan.py scan -p openssh -v 4.7 -o results.json
+
+# Limit CVEs per service
+python extra/cvescan.py scan -p openssh -v 4.7 --maxcve 5
+```
+
+## Database management
+
+Build or update the CVE database:
+
+```bash
+# Full build (requires NVD API key)
+python extra/cvescan.py update-db --api-key YOUR_KEY
+
+# Incremental update
+python extra/cvescan.py update-db
+
+# Skip ExploitDB title scraping
+python extra/cvescan.py update-db --no-scrape
+
+# Force full rebuild
+python extra/cvescan.py update-db --full
+
+# Include backport data from OSV.dev
+python extra/cvescan.py update-db --backports
+
+# Only update backport data (skip NVD)
+python extra/cvescan.py update-db --backports-only
+
+# Specify target ecosystems
+python extra/cvescan.py update-db --backports-only --ecosystems "Debian:12,Ubuntu:24.04"
+```
+
+The NVD API key can be provided via:
+1. `--api-key` flag
+2. `NVD_KEY` environment variable
+3. `.api` file in the working directory
+
+## Database info
+
+View database statistics:
+
+```bash
+python extra/cvescan.py db-info
+```
+
+Shows last update time, product count, CVE count, exploit/metasploit counts,
+and backport data per ecosystem.
+
+
+# Backport detection
+
+On Debian and Ubuntu systems, distribution maintainers backport security fixes
+into older upstream versions. Without backport awareness, the scanner reports
+false positives for CVEs that have already been patched.
+
+CVEScannerV3 addresses this with distro-aware scanning:
+
+**Automatic detection** — distro and release are detected from service banners:
+- SSH: `OpenSSH_9.2p1 Debian-2+deb12u7` -> Debian 12 (bookworm)
+- SSH: `OpenSSH_8.9p1 Ubuntu-3ubuntu0.10` -> Ubuntu 22.04
+- HTTP: Server headers containing `(Debian)`, `(Ubuntu)`, etc.
+
+**Manual override**:
+```bash
+python extra/cvescan.py scan -i services.json --distro debian --distro-release bookworm
+```
+
+**Offline backport database** — uses OSV.dev bulk exports:
+```bash
+# Fetch backport data for default ecosystems (Debian 11/12, Ubuntu 22.04/24.04)
+python extra/cvescan.py update-db --backports-only
+```
+
+**Online enrichment** — for CVEs with unknown backport status, query OSV.dev
+API at scan time:
+```bash
+python extra/cvescan.py scan -p openssh -v 8.4 --distro debian --distro-release bookworm --online
+```
+
+When backport detection is active, CVEs are split into `cves` (active) and
+`likely_patched` in the JSON output.
+
+**Supported data files:**
+- `extra/cpe-to-package.json` — maps CPE vendor:product to distro package names
+
 
 # Docker container
 We have prepared two containers configured and ready to be used, you can download them
@@ -318,9 +462,10 @@ docker run -v ./cve.db:/CVEScannerV3/cve.db -v /tmp/cvslogs:/tmp/cvslogs scmanja
 
 > **Note**: You can find your logs in `/tmp/cvslogs` directory
 
+
 # Query database
 There is a helper script, `extra/query.py` to retrieve information directly from the
-sqlite database.
+sqlite database. For most use cases, `extra/cvescan.py scan` is preferred.
 
 ```bash
 python extra/query.py -h
@@ -340,6 +485,9 @@ options:
   -r, --raw             Output raw data (no filters applied)
   -d, --debug           Debug messages
 ```
+
+<details>
+    <summary><b>query.py example</b></summary>
 
 ```bash
 python extra/query.py -p "gibbon" -v "25.0.0"
@@ -366,6 +514,32 @@ Multi match:
 | CVE-2023-45880 |        |  7.2   | gibbonedu | gibbon  |              |              |  25.0.00   |            | No  | No  |
 +----------------+--------+--------+-----------+---------+--------------+--------------+------------+------------+-----+-----+
 ```
+</details>
+
+
+# Errors and fixes
+## Blocked IP
+> Connection timeout/error during CRAWL phase (`database.py`)
+
+**Fix:** Wait 15 minutes before re-running `database.py`.
+
+## Missing luasql
+> cvescannerv3.nse:54: module 'luasql.sqlite3' not found:<br>
+> NSE failed to find nselib/luasql/sqlite3.lua in search paths.<br>
+> ...
+
+**Fix:** Install the library based on your OS (check [Requirements](#requirements))
+and create a symlink to Nmap search path.
+```bash
+apt install lua-sql-sqlite3
+ln -s /usr/lib/x86_64-linux-gnu/lua /usr/local/lib/lua
+```
+
+```bash
+apk add --no-cache lua5.4-sql-sqlite3
+ln -s /usr/lib/lua /usr/local/lib/lua
+```
+> Above commands may require super user permissions.
 
 
 # Acknowledgements
@@ -381,6 +555,8 @@ Structural Funds (ESF and FEDER)**
   > Can be found in **~/.msf4/store/modules_metadata.json** after running **msfconsole**
 
 - CVE information gathered from [nvd.nist.gov](https://nvd.nist.gov).
+
+- Backport data from [OSV.dev](https://osv.dev).
 
 # License
     CVEScannerV3  Copyright (C) 2021-2025 Sergio Chica Manjarrez @ pervasive.it.uc3m.es.
