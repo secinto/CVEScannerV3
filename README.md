@@ -61,7 +61,7 @@ pip install -r extra/requirements.txt
 
 If you don't have the database `cve.db`, you can build it using the standalone
 CLI, using `extra/database.py` directly, or download a (semi-updated) copy from
-[CVEScannerV3DB](https://github.com/scmanjarrez/CVEScannerV3DB) using `.sql`
+[CVEScannerV3DB](https://github.com/secinto/CVEScannerV3DB) using `.sql`
 files or under Actions->Latest->Summary->Artifacts.
 
 > This repository is updated every two weeks.
@@ -80,7 +80,7 @@ python extra/database.py
 
 ```bash
 # Using pre-built database
-git clone https://github.com/scmanjarrez/CVEScannerV3DB
+git clone https://github.com/secinto/CVEScannerV3DB
 cd CVEScannerV3DB && sh build.sh
 ```
 
@@ -451,13 +451,13 @@ When backport detection is active, CVEs are split into `cves` (active) and
 # Docker container
 We have prepared two containers configured and ready to be used, you can download them
 from DockerHub
-- Database embedded version: `scmanjarrez/cvescanner:db` or `scmanjarrez/cvescanner:latest`
-- No database: `scmanjarrez/cvescannerv3:nodb`
+- Database embedded version: `secinto/cvescanner:db` or `secinto/cvescanner:latest`
+- No database: `secinto/cvescannerv3:nodb`
 
 ```bash
-docker run -v /tmp/cvslogs:/tmp/cvslogs scmanjarrez/cvescanner --script-args log=/tmp/cvslogs/scan.log,json=/tmp/cvslogs/scan.json <TARGET>
+docker run -v /tmp/cvslogs:/tmp/cvslogs secinto/cvescanner --script-args log=/tmp/cvslogs/scan.log,json=/tmp/cvslogs/scan.json <TARGET>
 
-docker run -v ./cve.db:/CVEScannerV3/cve.db -v /tmp/cvslogs:/tmp/cvslogs scmanjarrez/cvescanner:nodb --script-args log=/tmp/cvslogs/cvescannerv3.log,json=/tmp/cvslogs/cvescannerv3.json <TARGET>
+docker run -v ./cve.db:/CVEScannerV3/cve.db -v /tmp/cvslogs:/tmp/cvslogs secinto/cvescanner:nodb --script-args log=/tmp/cvslogs/cvescannerv3.log,json=/tmp/cvslogs/cvescannerv3.json <TARGET>
 ```
 
 > **Note**: You can find your logs in `/tmp/cvslogs` directory
@@ -543,9 +543,7 @@ ln -s /usr/lib/lua /usr/local/lib/lua
 
 
 # Acknowledgements
-**This work has been supported by National R&D Project TEC2017-84197-C4-1-R and by
-the Comunidad de Madrid project CYNAMON P2018/TCS-4566 and co-financed by European
-Structural Funds (ESF and FEDER)**
+- Originally developed by [scmanjarrez/CVEScannerV3](https://github.com/scmanjarrez/CVEScannerV3).
 
 - Based on [alegr3/CVEscanner](https://github.com/alegr3/CVEscanner) script.
 
