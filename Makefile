@@ -1,4 +1,5 @@
 .PHONY: test lint clean install-deps docker bump-version release-notes tag release release-draft bump-and-release version help
+.DEFAULT_GOAL := help
 
 # Variables
 PROJECT_NAME=CVEScannerV3
