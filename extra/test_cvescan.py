@@ -631,6 +631,28 @@ class TestScanService(unittest.TestCase):
         )
         self.assertEqual(result["id"], "test-1")
 
+    def test_scan_cpe_with_capitalized_product(self):
+        # Regression: nmap emits "OpenSSH" as product label alongside a lowercase
+        # CPE. The CPE must win; otherwise case-sensitive SQL lookups return 0.
+        result = scan_service(
+            self.cur,
+            {"cpe": "cpe:/a:openbsd:openssh:4.7p1", "product": "OpenSSH"},
+            aliases=None, maxcve=0,
+        )
+        self.assertEqual(result["product"], "openssh")
+        self.assertGreater(result["total_cves"], 0)
+
+    def test_scan_product_capitalized(self):
+        # Regression: callers passing only a capitalised product (no CPE) must
+        # still match — defence-in-depth lowercase normalisation.
+        result = scan_service(
+            self.cur,
+            {"product": "OpenSSH", "version": "4.7", "version_update": "p1"},
+            aliases=None, maxcve=0,
+        )
+        self.assertEqual(result["product"], "openssh")
+        self.assertGreater(result["total_cves"], 0)
+
 
 class TestRunScan(unittest.TestCase):
     def setUp(self):

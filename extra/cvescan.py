@@ -518,7 +518,13 @@ def check_backports(cur, cve_ids, distro, distro_release, cpe_vendor,
         )
         rows = cur.fetchall()
     except sql.OperationalError:
-        # Table might not exist in older databases
+        # Table missing in older/half-built DBs. Surface a one-shot WARN so
+        # silent degradation (every CVE → "unknown") is visible to operators.
+        if not getattr(check_backports, "_warned_missing_table", False):
+            print("[cvescan] WARN: backports table missing from cve.db — "
+                  "all CVEs will be reported as unsuppressed. Rebuild "
+                  "cve.db with backports enabled.", file=sys.stderr)
+            check_backports._warned_missing_table = True
         return {cve_id: {"status": "unknown", "fixed_version": None}
                 for cve_id in cve_ids}
 
@@ -615,13 +621,13 @@ def scan_service(cur, service, aliases, maxcve, cache=None,
     # Resolve product and version info
     if service.get("cpe"):
         product, version_info = parse_cpe(service["cpe"])
-        # Allow explicit overrides
-        if service.get("product"):
-            product = service["product"]
+        # CPE is the canonical NVD identifier; do NOT override with banner labels
+        # (NVD products are lowercase; banner-derived labels are often capitalised
+        # and would cause case-sensitive SQL lookups to miss every row).
         if service.get("version") is not None:
             version_info = parse_version(service["version"])
     elif service.get("product"):
-        product = service["product"]
+        product = service["product"].lower()
         version_info = parse_version(service.get("version"))
     else:
         return None
