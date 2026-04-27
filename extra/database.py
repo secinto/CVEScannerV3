@@ -4,8 +4,7 @@
 
 # database - Database generator/updater.
 
-# Copyright (C) 2021-2025 Sergio Chica Manjarrez @ pervasive.it.uc3m.es.
-# Universidad Carlos III de Madrid.
+# Copyright (C) 2025 secinto GmbH.
 
 # This file is part of CVEScannerV3.
 
@@ -94,8 +93,7 @@ class DatabaseUpdateError(Exception):
 
 
 COPYRIGHT = """
-CVEScannerV3  Copyright (C) 2022-2025 Sergio Chica Manjarrez @ pervasive.it.uc3m.es.
-Universidad Carlos III de Madrid.
+CVEScannerV3  Copyright (C) 2025 secinto GmbH.
 This program comes with ABSOLUTELY NO WARRANTY; for details check below.
 This is free software, and you are welcome to redistribute it
 under certain conditions; check below for details.
@@ -380,11 +378,38 @@ class Database:
         self.conn.commit()
 
 
-DEFAULT_ECOSYSTEMS = ["Debian:12", "Debian:11", "Ubuntu:22.04", "Ubuntu:24.04"]
+DEFAULT_ECOSYSTEMS = [
+    "Debian:12",
+    "Debian:11",
+    "Ubuntu:24.04:LTS",
+    "Ubuntu:22.04:LTS",
+    "Ubuntu:20.04:LTS",
+]
 
 OSV_BULK_URL = (
     "https://osv-vulnerabilities.storage.googleapis.com/{ecosystem}/all.zip"
 )
+
+
+def parse_ecosystem(ecosystem):
+    """Split an OSV ecosystem string into (distro, release) for the backports table.
+
+    OSV bucket keys use distro-specific shapes:
+      - Debian uses ``Debian:<N>`` (e.g. ``Debian:12``)
+      - Ubuntu uses ``Ubuntu:<X.Y>[:LTS]`` (e.g. ``Ubuntu:22.04:LTS``)
+
+    The downstream lookup in ``cvescan.check_backports`` queries the table with
+    the canonical release form (``"22.04"``, not ``"22.04:LTS"``), so the
+    trailing ``:LTS`` segment is stripped here when storing rows. The original
+    ecosystem string is still used as the bucket key and as the per-record
+    ``package.ecosystem`` filter.
+    """
+    if ":" not in ecosystem:
+        return None, None
+    distro, _, release = ecosystem.partition(":")
+    if release.endswith(":LTS"):
+        release = release[: -len(":LTS")]
+    return distro, release
 
 
 def now():
@@ -409,11 +434,10 @@ def update_backports_osv(db_path, ecosystems=None):
     with Database(db_path) as db:
         db.setup()
         for ecosystem in ecosystems:
-            # ecosystem e.g. "Debian:12" → distro="Debian", release="12"
-            if ":" not in ecosystem:
+            distro, release = parse_ecosystem(ecosystem)
+            if not distro or not release:
                 print(f"[!] Invalid ecosystem format: {ecosystem}")
                 continue
-            distro, release = ecosystem.split(":", 1)
 
             url = OSV_BULK_URL.format(ecosystem=ecosystem)
             print(f"[*] Downloading OSV data for {ecosystem}...")
@@ -449,14 +473,21 @@ def update_backports_osv(db_path, ecosystems=None):
                 except (ValueError, KeyError):
                     continue
 
-                # Collect CVE IDs from id + aliases
+                # Collect CVE IDs from id, aliases, and related. Ubuntu OSV
+                # records use IDs like "UBUNTU-CVE-YYYY-NNNN" or "USN-…" and
+                # carry the canonical CVE only in `related`, so the alias-only
+                # path silently drops every Ubuntu entry.
                 cve_ids = set()
-                entry_id = entry.get("id", "")
-                if entry_id.startswith("CVE-"):
-                    cve_ids.add(entry_id)
-                for alias in entry.get("aliases", []):
-                    if alias.startswith("CVE-"):
-                        cve_ids.add(alias)
+                candidates = [entry.get("id", "")]
+                candidates.extend(entry.get("aliases") or [])
+                candidates.extend(entry.get("related") or [])
+                for cand in candidates:
+                    if not cand:
+                        continue
+                    if cand.startswith("CVE-"):
+                        cve_ids.add(cand)
+                    elif cand.startswith("UBUNTU-CVE-"):
+                        cve_ids.add(cand[len("UBUNTU-"):])
 
                 if not cve_ids:
                     continue

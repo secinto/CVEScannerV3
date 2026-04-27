@@ -4,8 +4,7 @@
 
 # cvescan - Standalone CVE detection/association engine.
 
-# Copyright (C) 2021-2025 Sergio Chica Manjarrez @ pervasive.it.uc3m.es.
-# Universidad Carlos III de Madrid.
+# Copyright (C) 2025 secinto GmbH.
 
 # This file is part of CVEScannerV3.
 

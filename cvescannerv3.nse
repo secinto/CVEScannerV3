@@ -2,8 +2,7 @@
 
 -- cvescannerv3 - NSE script.
 
--- Copyright (C) 2021-2025 Sergio Chica Manjarrez @ pervasive.it.uc3m.es.
--- Universidad Carlos III de Madrid.
+-- Copyright (C) 2025 secinto GmbH.
 
 -- This file is part of CVEScannerV3.
 
@@ -61,7 +60,7 @@ CVEs information gathered from nvd.nist.gov.
 ---
 
 categories = {"safe"}
-author = "Sergio Chica"
+author = "secinto GmbH"
 version = "3.4"
 
 local http = require 'http'

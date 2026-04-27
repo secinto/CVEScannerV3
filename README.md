@@ -557,8 +557,7 @@ ln -s /usr/lib/lua /usr/local/lib/lua
 - Backport data from [OSV.dev](https://osv.dev).
 
 # License
-    CVEScannerV3  Copyright (C) 2021-2025 Sergio Chica Manjarrez @ pervasive.it.uc3m.es.
-    Universidad Carlos III de Madrid.
+    CVEScannerV3  Copyright (C) 2025 secinto GmbH.
     This program comes with ABSOLUTELY NO WARRANTY; for details check below.
     This is free software, and you are welcome to redistribute it
     under certain conditions; check below for details.
