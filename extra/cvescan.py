@@ -30,7 +30,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "3.4"
+VERSION = "3.4.1"
 
 # Ensure extra/ is importable when running from project root
 sys.path.insert(0, str(Path(__file__).parent))

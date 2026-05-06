@@ -6,7 +6,7 @@ PROJECT_NAME=CVEScannerV3
 NSE_FILE=cvescannerv3.nse
 PYTHON_DIR=extra
 PYTHON_VERSION_FILE=extra/cvescan.py
-# Version is read directly from the NSE file (format: N.N or N.N.N)
+# Version is read directly from the NSE file (format: N.N.N)
 VERSION ?= $(shell grep '^version = ' $(NSE_FILE) | sed 's/version = "\(.*\)"/\1/' | tr -d ' ')
 GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -52,8 +52,8 @@ docker:
 	@echo "Docker image $(DOCKER_IMAGE) built"
 
 # Bump version in cvescannerv3.nse AND extra/cvescan.py.
-# Auto-increment: bumps the minor component for N.N, or patch for N.N.N.
-# Override with V=X.Y or V=X.Y.Z for an explicit version.
+# Auto-increment: bumps the patch component.
+# Override with V=X.Y.Z for an explicit version.
 bump-version:
 	@if [ -n "$(V)" ]; then \
 		NEW_VERSION="$(V)"; \
@@ -61,14 +61,10 @@ bump-version:
 		MAJOR=$$(echo "$(VERSION)" | cut -d. -f1); \
 		MINOR=$$(echo "$(VERSION)" | cut -d. -f2); \
 		PATCH_PART=$$(echo "$(VERSION)" | cut -d. -f3); \
-		if [ -n "$$PATCH_PART" ]; then \
-			NEW_VERSION="$$MAJOR.$$MINOR.$$((PATCH_PART + 1))"; \
-		else \
-			NEW_VERSION="$$MAJOR.$$((MINOR + 1))"; \
-		fi; \
+		NEW_VERSION="$$MAJOR.$$MINOR.$$((PATCH_PART + 1))"; \
 	fi; \
-	if ! echo "$$NEW_VERSION" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){1,2}$$'; then \
-		echo "Error: version '$$NEW_VERSION' must be N.N or N.N.N format"; exit 1; \
+	if ! echo "$$NEW_VERSION" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){2}$$'; then \
+		echo "Error: version '$$NEW_VERSION' must be N.N.N format"; exit 1; \
 	fi; \
 	V_MAJOR=$$(echo "$$NEW_VERSION" | cut -d. -f1); \
 	V_MINOR=$$(echo "$$NEW_VERSION" | cut -d. -f2); \
@@ -158,10 +154,10 @@ help:
 	@echo "  make clean            - Remove Python cache files"
 	@echo "  make docker           - Build Docker image"
 	@echo "  make version          - Show version information"
-	@echo "  make bump-version     - Bump minor version (or V=X.Y[.Z] for explicit version)"
+	@echo "  make bump-version     - Bump patch version (or V=X.Y.Z for explicit version)"
 	@echo "  make release-notes    - Generate release-notes/v{VERSION}.md from git log (skips if exists)"
 	@echo "  make tag              - Create and push git tag for current VERSION"
 	@echo "  make release          - Generate notes, tag, and publish GitHub release"
 	@echo "  make release-draft    - Generate notes and create a draft GitHub release"
-	@echo "  make bump-and-release - Bump version, generate notes, commit, push, then release (V=X.Y[.Z] optional)"
+	@echo "  make bump-and-release - Bump version, generate notes, commit, push, then release (V=X.Y.Z optional)"
 	@echo "  make help             - Show this help"
