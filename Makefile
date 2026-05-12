@@ -1,4 +1,4 @@
-.PHONY: test lint clean install-deps docker bump-version release-notes tag release release-draft bump-and-release version help
+.PHONY: test lint clean install-deps docker bump-version release-notes tag release release-draft bump-and-release _check-changes version help
 .DEFAULT_GOAL := help
 
 # Variables
@@ -51,10 +51,36 @@ docker:
 	docker build -t $(DOCKER_IMAGE) .
 	@echo "Docker image $(DOCKER_IMAGE) built"
 
+# Internal: abort (or prompt) if there are no commits since the last tag.
+# Skipped when invoked from another release target via SKIP_CHANGE_CHECK=1.
+_check-changes:
+	@if [ "$$SKIP_CHANGE_CHECK" = "1" ]; then exit 0; fi; \
+	LAST_TAG=$$(git describe --tags --abbrev=0 2>/dev/null); \
+	if [ -z "$$LAST_TAG" ]; then \
+		echo "No previous tags found; treating as first release."; \
+		exit 0; \
+	fi; \
+	COMMITS=$$(git log "$$LAST_TAG..HEAD" --oneline 2>/dev/null | wc -l | tr -d ' '); \
+	if [ "$$COMMITS" = "0" ]; then \
+		echo "No commits since $$LAST_TAG."; \
+		if ! { : >/dev/tty; } 2>/dev/null; then \
+			echo "No TTY available; aborting (set SKIP_CHANGE_CHECK=1 to override)." >&2; \
+			exit 1; \
+		fi; \
+		printf "No changes to release. Proceed anyway? [y/N] " > /dev/tty; \
+		read REPLY < /dev/tty; \
+		case "$$REPLY" in \
+			y|Y|yes|YES) echo "Proceeding..." ;; \
+			*) echo "Aborted."; exit 1 ;; \
+		esac; \
+	else \
+		echo "Found $$COMMITS commit(s) since $$LAST_TAG."; \
+	fi
+
 # Bump version in cvescannerv3.nse AND extra/cvescan.py.
 # Auto-increment: bumps the patch component.
 # Override with V=X.Y.Z for an explicit version.
-bump-version:
+bump-version: _check-changes
 	@if [ -n "$(V)" ]; then \
 		NEW_VERSION="$(V)"; \
 	else \
@@ -106,7 +132,7 @@ tag:
 	@echo "Tag $(TAG) created and pushed"
 
 # Generate release notes, tag, and publish a GitHub release (no binary assets)
-release: release-notes tag
+release: _check-changes release-notes tag
 	@echo "Creating GitHub release $(TAG)..."
 	@which gh > /dev/null || (echo "Error: gh CLI not installed. Run: brew install gh"; exit 1)
 	gh release create $(TAG) \
@@ -125,18 +151,18 @@ release-draft: release-notes
 	@echo "Draft release $(TAG) created"
 
 # Bump version (minor by default, or V=X.Y[.Z]), generate notes, commit, push, then release
-bump-and-release:
+bump-and-release: _check-changes
 	@if [ -n "$(V)" ]; then \
-		$(MAKE) bump-version V=$(V); \
+		$(MAKE) SKIP_CHANGE_CHECK=1 bump-version V=$(V); \
 	else \
-		$(MAKE) bump-version; \
+		$(MAKE) SKIP_CHANGE_CHECK=1 bump-version; \
 	fi
-	$(MAKE) release-notes
+	$(MAKE) SKIP_CHANGE_CHECK=1 release-notes
 	@NEW_VER=$$(grep '^version = ' $(NSE_FILE) | sed 's/version = "\(.*\)"/\1/' | tr -d ' '); \
 	git add $(NSE_FILE) $(PYTHON_VERSION_FILE) release-notes/v$$NEW_VER.md; \
 	git commit -m "chore: bump version to v$$NEW_VER"; \
 	git push origin $(GIT_BRANCH)
-	$(MAKE) release
+	$(MAKE) SKIP_CHANGE_CHECK=1 release
 
 # Show version
 version:
