@@ -2,27 +2,32 @@
   "openbsd:openssh": {
     "debian": "openssh",
     "ubuntu": "openssh",
-    "alpine": "openssh"
+    "alpine": "openssh",
+    "rhel": "openssh"
   },
   "apache:http_server": {
     "debian": "apache2",
     "ubuntu": "apache2",
-    "alpine": "apache2"
+    "alpine": "apache2",
+    "rhel": "httpd"
   },
   "openssl:openssl": {
     "debian": "openssl",
     "ubuntu": "openssl",
-    "alpine": "openssl"
+    "alpine": "openssl",
+    "rhel": "openssl"
   },
   "isc:bind": {
     "debian": "bind9",
     "ubuntu": "bind9",
-    "alpine": "bind"
+    "alpine": "bind",
+    "rhel": "bind"
   },
   "nginx:nginx": {
     "debian": "nginx",
     "ubuntu": "nginx",
-    "alpine": "nginx"
+    "alpine": "nginx",
+    "rhel": "nginx"
   },
   "oracle:mysql": {
     "debian": "mysql-8.0",

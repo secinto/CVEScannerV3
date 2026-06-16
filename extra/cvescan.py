@@ -565,14 +565,22 @@ def check_backports(cur, cve_ids, distro, distro_release, cpe_vendor,
     return backport_info
 
 
-def annotate_confidence(cve_list, distro, distro_release, backport_results):
+def annotate_confidence(cve_list, distro, distro_release, backport_results,
+                        crypto=None):
     """Annotate CVEs with confidence levels and split into active vs patched.
+
+    crypto: optional SSH crypto-fingerprint evidence dict (Tier 2) from
+            ssh_fingerprint.analyze_ssh_crypto. When present it can override the
+            banner/backport verdict for the Terrapin CVE and corroborates other
+            backport suppressions.
 
     Returns (active_cves, patched_cves).
     """
     if not distro:
         # No distro detected — all CVEs are upstream matches, no split
         return cve_list, []
+
+    from ssh_fingerprint import TERRAPIN_CVE
 
     active = []
     patched = []
@@ -583,10 +591,34 @@ def annotate_confidence(cve_list, distro, distro_release, backport_results):
         bp_status = bp.get("status", "unknown")
         fixed_version = bp.get("fixed_version")
 
+        # Tier 2: the SSH crypto fingerprint decides the Terrapin CVE directly,
+        # overriding banner/backport inference in either direction.
+        if crypto and cve_id == TERRAPIN_CVE and crypto.get("has_crypto_evidence"):
+            if crypto.get("strict_kex"):
+                # strict KEX offered → mitigated regardless of version banner
+                cve["confidence"] = "LIKELY_PATCHED"
+                cve["crypto_evidence"] = "strict_kex_present"
+                if fixed_version:
+                    cve["fixed_version"] = fixed_version
+                patched.append(cve)
+                continue
+            if crypto.get("terrapin_vulnerable"):
+                # Negotiable Terrapin cipher/MAC and no strict KEX → actually
+                # exploitable. Never suppress, even if a distro fix exists.
+                cve["confidence"] = "UPSTREAM_MATCH"
+                cve["crypto_evidence"] = "terrapin_vulnerable"
+                active.append(cve)
+                continue
+
         if bp_status == "patched":
             cve["confidence"] = "LIKELY_PATCHED"
             if fixed_version:
                 cve["fixed_version"] = fixed_version
+            # Tier 2: strict KEX proves the binary is patched beyond the
+            # upstream version the banner claims — strong corroboration that the
+            # distro backport applies to this running binary.
+            if crypto and crypto.get("backport_corroborated"):
+                cve["crypto_evidence"] = "backport_corroborated"
             patched.append(cve)
         elif bp_status == "affected":
             cve["confidence"] = "UPSTREAM_MATCH"
@@ -645,6 +677,12 @@ def scan_service(cur, service, aliases, maxcve, cache=None,
 
     # Detect distro
     distro, distro_release = _detect_distro(service)
+
+    # Tier 2: SSH crypto fingerprint (from ssh2-enum-algos), if the producer
+    # supplied the algorithm lists. Corroborates backport suppression and
+    # decides the Terrapin CVE directly.
+    from ssh_fingerprint import crypto_from_service
+    crypto = crypto_from_service(service)
 
     # Query for all product name variants (original + aliases)
     all_products = resolve_aliases(product, aliases)
@@ -739,7 +777,7 @@ def scan_service(cur, service, aliases, maxcve, cache=None,
 
     # Annotate confidence and split
     active_cves, patched_cves = annotate_confidence(
-        cve_list, distro, distro_release, backport_results,
+        cve_list, distro, distro_release, backport_results, crypto=crypto,
     )
 
     result = {
@@ -753,6 +791,8 @@ def scan_service(cur, service, aliases, maxcve, cache=None,
         result["distro"] = distro
         if distro_release:
             result["distro_release"] = distro_release
+    if crypto and crypto.get("has_crypto_evidence"):
+        result["ssh_crypto"] = crypto
     if patched_cves:
         result["likely_patched"] = patched_cves
     if "id" in service:

@@ -390,6 +390,19 @@ OSV_BULK_URL = (
     "https://osv-vulnerabilities.storage.googleapis.com/{ecosystem}/all.zip"
 )
 
+# OSV publishes Debian/Ubuntu bulk exports keyed per release (the bucket name
+# includes the release, e.g. "Debian:12"). RHEL-family distros instead publish
+# ONE bulk export per distro covering all releases — the bucket name is the
+# bare distro ("AlmaLinux", "Rocky Linux", "Red Hat") and the release lives only
+# in each record's package.ecosystem ("AlmaLinux:8"). So the download bucket and
+# the per-record ecosystem filter differ for these distros.
+_COMBINED_BULK_DISTROS = {"AlmaLinux", "Rocky Linux", "Red Hat"}
+
+
+def _bulk_bucket(distro, ecosystem):
+    """OSV bulk-export bucket name for an ecosystem (see _COMBINED_BULK_DISTROS)."""
+    return distro if distro in _COMBINED_BULK_DISTROS else ecosystem
+
 
 def parse_ecosystem(ecosystem):
     """Split an OSV ecosystem string into (distro, release) for the backports table.
@@ -427,9 +440,14 @@ def update_backports_osv(db_path, ecosystems=None):
     import io
     import json as _json
     import zipfile
+    from urllib.parse import quote
 
     if ecosystems is None:
         ecosystems = DEFAULT_ECOSYSTEMS
+
+    # Cache downloaded bulk zips: RHEL-family releases (AlmaLinux:8, AlmaLinux:9)
+    # share one per-distro bucket, so we fetch it once and filter per release.
+    bulk_cache = {}
 
     with Database(db_path) as db:
         db.setup()
@@ -439,21 +457,25 @@ def update_backports_osv(db_path, ecosystems=None):
                 print(f"[!] Invalid ecosystem format: {ecosystem}")
                 continue
 
-            url = OSV_BULK_URL.format(ecosystem=ecosystem)
-            print(f"[*] Downloading OSV data for {ecosystem}...")
-
-            try:
-                resp = httpx.get(url, timeout=300, follow_redirects=True)
-                resp.raise_for_status()
-            except (httpx.HTTPError, httpx.TimeoutException) as e:
-                print(f"[!] Failed to download {ecosystem}: {e}")
-                continue
-
-            try:
-                zf = zipfile.ZipFile(io.BytesIO(resp.content))
-            except zipfile.BadZipFile:
-                print(f"[!] Invalid zip file for {ecosystem}")
-                continue
+            bulk_name = _bulk_bucket(distro, ecosystem)
+            zf = bulk_cache.get(bulk_name)
+            if zf is None:
+                # Preserve ":" (a literal segment in OSV bucket keys), encode
+                # spaces ("Rocky Linux" → "Rocky%20Linux").
+                url = OSV_BULK_URL.format(ecosystem=quote(bulk_name, safe=":"))
+                print(f"[*] Downloading OSV data for {bulk_name}...")
+                try:
+                    resp = httpx.get(url, timeout=300, follow_redirects=True)
+                    resp.raise_for_status()
+                except (httpx.HTTPError, httpx.TimeoutException) as e:
+                    print(f"[!] Failed to download {bulk_name}: {e}")
+                    continue
+                try:
+                    zf = zipfile.ZipFile(io.BytesIO(resp.content))
+                except zipfile.BadZipFile:
+                    print(f"[!] Invalid zip file for {bulk_name}")
+                    continue
+                bulk_cache[bulk_name] = zf
 
             # Clear existing data for this ecosystem
             db.cursor.execute(
