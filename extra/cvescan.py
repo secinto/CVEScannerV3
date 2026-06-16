@@ -551,6 +551,13 @@ def check_backports(cur, cve_ids, distro, distro_release, cpe_vendor,
                     "status": "patched",
                     "fixed_version": fixed_version,
                 }
+        elif status == "not_affected":
+            # Vendor (Red Hat securitydata) states this release is not
+            # vulnerable — suppress as a false positive.
+            backport_info[cve_id] = {
+                "status": "not_affected",
+                "fixed_version": None,
+            }
         else:
             backport_info[cve_id] = {
                 "status": "affected",
@@ -619,6 +626,11 @@ def annotate_confidence(cve_list, distro, distro_release, backport_results,
             # distro backport applies to this running binary.
             if crypto and crypto.get("backport_corroborated"):
                 cve["crypto_evidence"] = "backport_corroborated"
+            patched.append(cve)
+        elif bp_status == "not_affected":
+            # Vendor states the release is not vulnerable (Red Hat "Not
+            # affected") — suppress as a false positive.
+            cve["confidence"] = "DISTRO_NOT_AFFECTED"
             patched.append(cve)
         elif bp_status == "affected":
             cve["confidence"] = "UPSTREAM_MATCH"

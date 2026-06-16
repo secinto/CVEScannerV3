@@ -46,6 +46,11 @@ from ssh_fingerprint import (
     analyze_ssh_crypto,
     crypto_from_service,
 )
+from redhat_backport import (
+    is_not_affected,
+    rh_fix_state,
+    rh_fixed_version,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1083,6 +1088,68 @@ class TestCryptoAnnotateConfidence(unittest.TestCase):
             self._cves("CVE-2020-1"), "rhel", "8", bp)
         self.assertEqual(patched[0]["confidence"], "LIKELY_PATCHED")
         self.assertNotIn("crypto_evidence", patched[0])
+
+
+# ---------------------------------------------------------------------------
+# Tests: Red Hat securitydata backfill parse helpers
+# ---------------------------------------------------------------------------
+
+class TestRedhatBackport(unittest.TestCase):
+    def test_fixed_version_el8(self):
+        self.assertEqual(
+            rh_fixed_version(["openssh-0:8.0p1-10.el8"], "openssh", "8"),
+            "8.0p1-10.el8")
+
+    def test_fixed_version_el8_zstream(self):
+        self.assertEqual(
+            rh_fixed_version(["openssh-0:8.0p1-19.el8_8"], "openssh", "8"),
+            "8.0p1-19.el8_8")
+
+    def test_fixed_version_wrong_release(self):
+        # an el8 build must not satisfy a release=9 query
+        self.assertIsNone(
+            rh_fixed_version(["openssh-0:8.0p1-10.el8"], "openssh", "9"))
+
+    def test_fixed_version_el9(self):
+        self.assertEqual(
+            rh_fixed_version(["openssh-0:8.7p1-38.el9"], "openssh", "9"),
+            "8.7p1-38.el9")
+
+    def test_fixed_version_subpackage(self):
+        # subpackages share the source RPM EVR and are accepted
+        self.assertEqual(
+            rh_fixed_version(["openssh-server-0:8.0p1-10.el8"], "openssh", "8"),
+            "8.0p1-10.el8")
+
+    def test_fixed_version_other_distro(self):
+        self.assertIsNone(
+            rh_fixed_version(["openssh-main-10.3p1-2.hum1"], "openssh", "8"))
+        self.assertIsNone(rh_fixed_version([], "openssh", "8"))
+
+    def test_fix_state_el8(self):
+        ps = [{"product_name": "Red Hat Enterprise Linux 8",
+               "fix_state": "Not affected", "package_name": "openssh",
+               "cpe": "cpe:/o:redhat:enterprise_linux:8"}]
+        self.assertEqual(rh_fix_state(ps, "openssh", "8"), "Not affected")
+        self.assertIsNone(rh_fix_state(ps, "openssh", "9"))
+        self.assertIsNone(rh_fix_state(None, "openssh", "8"))
+
+    def test_is_not_affected(self):
+        self.assertTrue(is_not_affected("Not affected"))
+        self.assertTrue(is_not_affected("not affected"))
+        self.assertFalse(is_not_affected("Will not fix"))
+        self.assertFalse(is_not_affected("Fix deferred"))
+        self.assertFalse(is_not_affected(None))
+
+
+class TestNotAffectedConfidence(unittest.TestCase):
+    def test_not_affected_suppressed(self):
+        cves = [{"cve_id": "CVE-2019-16905", "cvss_v3": 8.8, "cvss_v2": None}]
+        bp = {"CVE-2019-16905": {"status": "not_affected", "fixed_version": None}}
+        active, patched = annotate_confidence(cves, "rhel", "8", bp)
+        self.assertEqual(len(active), 0)
+        self.assertEqual(len(patched), 1)
+        self.assertEqual(patched[0]["confidence"], "DISTRO_NOT_AFFECTED")
 
 
 # ---------------------------------------------------------------------------

@@ -577,6 +577,114 @@ def update_backports_osv(db_path, ecosystems=None):
     print("[+] Backport data update complete")
 
 
+# ---------------------------------------------------------------------------
+# Red Hat securitydata — secondary backport source for the el8/el9 family.
+#
+# AlmaLinux's OSV (ALSA) feed misses some fixes Red Hat shipped (e.g.
+# CVE-2020-14145, fixed in openssh-8.0p1-10.el8 via RHSA-2021:4368) and carries
+# NO "Not affected" dispositions. Red Hat's securitydata API has both. Rows are
+# merged into the AlmaLinux:N proxy bucket with INSERT OR IGNORE so the primary
+# ALSA data wins and Red Hat only backfills gaps.
+# ---------------------------------------------------------------------------
+
+from redhat_backport import (  # noqa: E402
+    RH_SECURITYDATA,
+    is_not_affected,
+    rh_fixed_version,
+    rh_fix_state,
+)
+
+
+def update_backports_redhat(db_path, releases=("8", "9"),
+                            packages=("openssh",), max_workers=8):
+    """Backfill the backports table from Red Hat securitydata for the el family.
+
+    For each package: one list call yields all CVEs + RHSA-fixed builds; the
+    unfixed remainder is detail-fetched concurrently to read package_state, so
+    "Not affected" CVEs are suppressed and genuinely-affected ones left active.
+    Rows land in the AlmaLinux:<release> bucket (INSERT OR IGNORE).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _get(url):
+        resp = httpx.get(url, timeout=60, follow_redirects=True,
+                         headers={"User-Agent": "checkfix-cvescanner"})
+        resp.raise_for_status()
+        return resp.json()
+
+    with Database(db_path) as db:
+        db.setup()
+        total = 0
+        for package in packages:
+            try:
+                listing = _get(f"{RH_SECURITYDATA}/cve.json"
+                               f"?package={package}&per_page=5000")
+            except (httpx.HTTPError, httpx.TimeoutException, ValueError) as e:
+                print(f"[!] Red Hat list fetch failed for {package}: {e}")
+                continue
+
+            rows = []
+            need_detail = []  # (cve_id, [releases without a fixed build])
+            for entry in listing:
+                cve_id = entry.get("CVE", "")
+                if not cve_id.startswith("CVE-"):
+                    continue
+                affected = entry.get("affected_packages") or []
+                missing = []
+                for rel in releases:
+                    fixed = rh_fixed_version(affected, package, rel)
+                    if fixed:
+                        rows.append((cve_id, "AlmaLinux", rel, package,
+                                     fixed, "fixed"))
+                        total += 1
+                    else:
+                        missing.append(rel)
+                if missing:
+                    need_detail.append((cve_id, missing))
+
+            # Detail-fetch the unfixed remainder for package_state dispositions.
+            def _fetch(item):
+                cve_id, miss = item
+                try:
+                    d = _get(f"{RH_SECURITYDATA}/cve/{cve_id}.json")
+                except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+                    return []
+                pstate = d.get("package_state")
+                out = []
+                for rel in miss:
+                    if is_not_affected(rh_fix_state(pstate, package, rel)):
+                        out.append((cve_id, "AlmaLinux", rel, package,
+                                    None, "not_affected"))
+                return out
+
+            if need_detail:
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    for res in ex.map(_fetch, need_detail):
+                        rows.extend(res)
+                        total += len(res)
+
+            db.cursor.executemany(
+                "INSERT OR IGNORE INTO backports "
+                "(cve_id, distro, release, package, fixed_version, status) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            db.conn.commit()
+            print(f"[+] Red Hat {package}: {len(rows)} rows "
+                  f"({len(listing)} CVEs scanned)")
+
+        for rel in releases:
+            db.cursor.execute(
+                "INSERT OR REPLACE INTO backport_metadata "
+                "(id, ecosystem, last_updated, record_count) VALUES ("
+                "(SELECT id FROM backport_metadata WHERE ecosystem = ?), "
+                "?, ?, ?)",
+                [f"RedHat:{rel}", f"RedHat:{rel}", now(), total],
+            )
+        db.conn.commit()
+    print(f"[+] Red Hat securitydata backfill complete ({total} rows)")
+
+
 def _norm(string):
     return string.replace("\\", "")
 
@@ -928,7 +1036,9 @@ def update_exploitdb(args):
 
 
 def run_update(database, api_key, noscrape=False, full=False,
-               backports=False, backports_only=False, ecosystems=None):
+               backports=False, backports_only=False, ecosystems=None,
+               redhat=False, redhat_packages=("openssh",),
+               redhat_releases=("8", "9")):
     """Run the database create/update process.
 
     Args:
@@ -955,6 +1065,9 @@ def run_update(database, api_key, noscrape=False, full=False,
         with Database(database) as db:
             db.setup()
         update_backports_osv(database, ecosystems=ecosystems)
+        if redhat:
+            update_backports_redhat(database, releases=redhat_releases,
+                                    packages=redhat_packages)
         return
 
     if full and database.is_file():
@@ -990,6 +1103,9 @@ def run_update(database, api_key, noscrape=False, full=False,
 
     if backports:
         update_backports_osv(database, ecosystems=ecosystems)
+        if redhat:
+            update_backports_redhat(database, releases=redhat_releases,
+                                    packages=redhat_packages)
 
 
 if __name__ == "__main__":
@@ -1019,11 +1135,31 @@ if __name__ == "__main__":
         "--ecosystems",
         help="Comma-separated OSV ecosystems (default: Debian:12,Debian:11,Ubuntu:22.04,Ubuntu:24.04)",
     )
+    parser.add_argument(
+        "--redhat",
+        action="store_true",
+        help="Also backfill el8/el9 backports from Red Hat securitydata "
+             "(fixed versions ALSA misses + 'Not affected' dispositions)",
+    )
+    parser.add_argument(
+        "--redhat-packages",
+        default="openssh",
+        help="Comma-separated source packages for the Red Hat backfill "
+             "(default: openssh)",
+    )
+    parser.add_argument(
+        "--redhat-releases",
+        default="8,9",
+        help="Comma-separated el releases for the Red Hat backfill (default: 8,9)",
+    )
     args = parser.parse_args()
 
     ecosystems = None
     if args.ecosystems:
         ecosystems = [e.strip() for e in args.ecosystems.split(",")]
+
+    redhat_packages = tuple(p.strip() for p in args.redhat_packages.split(",") if p.strip())
+    redhat_releases = tuple(r.strip() for r in args.redhat_releases.split(",") if r.strip())
 
     api = Path(".api")
     if api.is_file():
@@ -1048,6 +1184,9 @@ if __name__ == "__main__":
             backports=args.backports,
             backports_only=args.backports_only,
             ecosystems=ecosystems,
+            redhat=args.redhat,
+            redhat_packages=redhat_packages,
+            redhat_releases=redhat_releases,
         )
     except DatabaseUpdateError as e:
         print(f"[!] {e}")
