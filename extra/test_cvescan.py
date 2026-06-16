@@ -48,6 +48,7 @@ from ssh_fingerprint import (
 )
 from redhat_backport import (
     is_not_affected,
+    rh_disposition,
     rh_fix_state,
     rh_fixed_version,
 )
@@ -1141,6 +1142,15 @@ class TestRedhatBackport(unittest.TestCase):
         self.assertFalse(is_not_affected("Fix deferred"))
         self.assertFalse(is_not_affected(None))
 
+    def test_disposition_mapping(self):
+        self.assertEqual(rh_disposition("Not affected"), "not_affected")
+        self.assertEqual(rh_disposition("Will not fix"), "wont_fix")
+        self.assertEqual(rh_disposition("Out of support scope"), "wont_fix")
+        self.assertEqual(rh_disposition("Fix deferred"), "fix_deferred")
+        self.assertEqual(rh_disposition("Affected"), "affected")
+        self.assertIsNone(rh_disposition("Under investigation"))
+        self.assertIsNone(rh_disposition(None))
+
 
 class TestNotAffectedConfidence(unittest.TestCase):
     def test_not_affected_suppressed(self):
@@ -1150,6 +1160,33 @@ class TestNotAffectedConfidence(unittest.TestCase):
         self.assertEqual(len(active), 0)
         self.assertEqual(len(patched), 1)
         self.assertEqual(patched[0]["confidence"], "DISTRO_NOT_AFFECTED")
+
+    def test_wont_fix_active_badged(self):
+        cves = [{"cve_id": "CVE-2023-51767", "cvss_v3": 7.0, "cvss_v2": None}]
+        bp = {"CVE-2023-51767": {"status": "wont_fix", "disposition": "wont_fix",
+                                 "fixed_version": None,
+                                 "reason": "Red Hat: Will not fix (el8)",
+                                 "source": "redhat-securitydata",
+                                 "citation": "https://access.redhat.com/security/cve/CVE-2023-51767"}}
+        active, patched = annotate_confidence(cves, "rhel", "8", bp)
+        self.assertEqual(len(patched), 0)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["confidence"], "VENDOR_WONT_FIX")
+        # disposition metadata carried onto the CVE for the report/frontend
+        self.assertEqual(active[0]["disposition"], "wont_fix")
+        self.assertEqual(active[0]["reason"], "Red Hat: Will not fix (el8)")
+        self.assertEqual(active[0]["source"], "redhat-securitydata")
+        self.assertTrue(active[0]["citation"].endswith("CVE-2023-51767"))
+
+    def test_fix_deferred_active_badged(self):
+        cves = [{"cve_id": "CVE-2025-32728", "cvss_v3": 4.3, "cvss_v2": None}]
+        bp = {"CVE-2025-32728": {"status": "fix_deferred",
+                                 "disposition": "fix_deferred",
+                                 "fixed_version": None}}
+        active, patched = annotate_confidence(cves, "rhel", "8", bp)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["confidence"], "VENDOR_FIX_DEFERRED")
+        self.assertEqual(active[0]["disposition"], "fix_deferred")
 
 
 # ---------------------------------------------------------------------------

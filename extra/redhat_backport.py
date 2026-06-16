@@ -22,6 +22,21 @@ _RE_RPM_EVR = re.compile(
 # fix_state values that mean "this release is provably not vulnerable" → suppress.
 NOT_AFFECTED_STATES = {"not affected"}
 
+# Red Hat package_state fix_state → our disposition enum. Anything not listed
+# (e.g. "Under investigation", "New") is left out so the CVE stays active/unknown.
+FIX_STATE_DISPOSITION = {
+    "not affected": "not_affected",       # suppressed — provably not vulnerable
+    "will not fix": "wont_fix",           # surfaced + badged — vendor accepted risk
+    "out of support scope": "wont_fix",   # surfaced + badged — release EOL, no fix
+    "fix deferred": "fix_deferred",       # surfaced + badged — fix pending
+    "affected": "affected",               # active — confirmed affected, no fix yet
+}
+
+
+def rh_disposition(fix_state):
+    """Map a Red Hat fix_state to our disposition enum, or None to leave unknown."""
+    return FIX_STATE_DISPOSITION.get((fix_state or "").strip().lower())
+
 
 def rh_fixed_version(affected_packages, package, release):
     """el<release> fixed version (epoch-stripped, OSV-shaped) for `package`.

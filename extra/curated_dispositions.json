@@ -1,0 +1,16 @@
+{
+  "_comment": "Curated, version-controlled CVE disposition overlay for the distro-backport pipeline. Highest precedence: merged into cve.db's backports table LAST (INSERT OR REPLACE), so these analyst-verified entries override the auto-sourced OSV (AlmaLinux/Debian/Ubuntu) and Red Hat securitydata data. This is the 'improve over time' store — add an entry whenever triage (e.g. a credentialed `rpm -q --changelog` check, or an accepted-risk decision) establishes a disposition the auto feeds don't carry. Reviewed on every CVE DB rebuild. Each entry is scoped per (cve, distro, release, package); use distro 'AlmaLinux' as the el8/el9 family proxy (RHEL/CloudLinux/Rocky/CentOS). disposition is one of: fixed (suppressed; set fixed_version), not_affected (suppressed), false_positive (suppressed; stored as not_affected), wont_fix (active + badged), fix_deferred (active + badged), affected (active). For product-scoped (non-distro) false positives, use checkfix_test/resources/cve_false_positives.json instead.",
+  "_example": {
+    "cve": "CVE-0000-00000",
+    "distro": "AlmaLinux",
+    "release": "8",
+    "package": "openssh",
+    "disposition": "not_affected",
+    "fixed_version": null,
+    "reason": "Confirmed via rpm -q --changelog: vulnerable code path not compiled in el8.",
+    "citation": "https://access.redhat.com/security/cve/CVE-0000-00000",
+    "added_by": "analyst",
+    "date": "2026-06-16"
+  },
+  "dispositions": []
+}

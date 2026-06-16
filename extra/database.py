@@ -200,6 +200,9 @@ class Database:
                 package TEXT NOT NULL,
                 fixed_version TEXT,
                 status TEXT NOT NULL,
+                reason TEXT,
+                source TEXT,
+                citation TEXT,
                 UNIQUE (cve_id, distro, release, package)
             );
 
@@ -230,6 +233,21 @@ class Database:
                 ON backports(package, distro, release);
             """
         )
+        self._migrate_backports_columns()
+
+    def _migrate_backports_columns(self):
+        """Idempotently add disposition columns to a pre-existing backports table.
+
+        CREATE TABLE IF NOT EXISTS won't add columns to a DB built before these
+        existed; add them in place so older cve.db files upgrade without a full
+        rebuild (the weekly rebuild self-heals too).
+        """
+        existing = {row[1] for row in self.cursor.execute(
+            "PRAGMA table_info(backports)").fetchall()}
+        for col in ("reason", "source", "citation"):
+            if col not in existing:
+                self.cursor.execute(
+                    f"ALTER TABLE backports ADD COLUMN {col} TEXT")
 
     def cached_metadata(self):
         self.cursor.execute("SELECT last_mod FROM metadata")
@@ -533,19 +551,25 @@ def update_backports_osv(db_path, ecosystems=None):
                                 fixed_version = event["fixed"]
                                 status = "fixed"
 
+                    advisory = entry.get("id", "")
+                    source = f"osv-{distro.lower().replace(' ', '')}"
+                    if status == "fixed":
+                        reason = f"{distro} {release}: fixed in {fixed_version}"
+                    else:
+                        reason = f"{distro} {release}: affected"
                     for cve_id in cve_ids:
                         batch.append((
                             cve_id, distro, release, pkg_name,
-                            fixed_version, status,
+                            fixed_version, status, reason, source, advisory,
                         ))
                         record_count += 1
 
                 # Flush in batches of 5000
                 if len(batch) >= 5000:
                     db.cursor.executemany(
-                        "INSERT OR REPLACE INTO backports "
-                        "(cve_id, distro, release, package, fixed_version, status) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        "INSERT OR REPLACE INTO backports (cve_id, distro, "
+                        "release, package, fixed_version, status, reason, "
+                        "source, citation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         batch,
                     )
                     db.conn.commit()
@@ -554,9 +578,9 @@ def update_backports_osv(db_path, ecosystems=None):
             # Flush remaining
             if batch:
                 db.cursor.executemany(
-                    "INSERT OR REPLACE INTO backports "
-                    "(cve_id, distro, release, package, fixed_version, status) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO backports (cve_id, distro, "
+                    "release, package, fixed_version, status, reason, "
+                    "source, citation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     batch,
                 )
                 db.conn.commit()
@@ -589,10 +613,14 @@ def update_backports_osv(db_path, ecosystems=None):
 
 from redhat_backport import (  # noqa: E402
     RH_SECURITYDATA,
-    is_not_affected,
+    rh_disposition,
     rh_fixed_version,
     rh_fix_state,
 )
+
+
+def _rh_cve_url(cve_id):
+    return f"https://access.redhat.com/security/cve/{cve_id}"
 
 
 def update_backports_redhat(db_path, releases=("8", "9"),
@@ -600,9 +628,11 @@ def update_backports_redhat(db_path, releases=("8", "9"),
     """Backfill the backports table from Red Hat securitydata for the el family.
 
     For each package: one list call yields all CVEs + RHSA-fixed builds; the
-    unfixed remainder is detail-fetched concurrently to read package_state, so
-    "Not affected" CVEs are suppressed and genuinely-affected ones left active.
-    Rows land in the AlmaLinux:<release> bucket (INSERT OR IGNORE).
+    unfixed remainder is detail-fetched concurrently to read package_state.
+    Records every disposition — fixed / not_affected (suppressed),
+    wont_fix / fix_deferred (surfaced + badged), affected (active) — with a
+    human reason + source + citation. Rows land in the AlmaLinux:<release>
+    bucket (INSERT OR IGNORE so the primary ALSA data wins).
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -634,8 +664,10 @@ def update_backports_redhat(db_path, releases=("8", "9"),
                 for rel in releases:
                     fixed = rh_fixed_version(affected, package, rel)
                     if fixed:
-                        rows.append((cve_id, "AlmaLinux", rel, package,
-                                     fixed, "fixed"))
+                        rows.append((
+                            cve_id, "AlmaLinux", rel, package, fixed, "fixed",
+                            f"Red Hat: fixed in {fixed}",
+                            "redhat-securitydata", _rh_cve_url(cve_id)))
                         total += 1
                     else:
                         missing.append(rel)
@@ -652,9 +684,13 @@ def update_backports_redhat(db_path, releases=("8", "9"),
                 pstate = d.get("package_state")
                 out = []
                 for rel in miss:
-                    if is_not_affected(rh_fix_state(pstate, package, rel)):
-                        out.append((cve_id, "AlmaLinux", rel, package,
-                                    None, "not_affected"))
+                    state = rh_fix_state(pstate, package, rel)
+                    disp = rh_disposition(state)
+                    if disp:
+                        out.append((
+                            cve_id, "AlmaLinux", rel, package, None, disp,
+                            f"Red Hat: {state} (el{rel})",
+                            "redhat-securitydata", _rh_cve_url(cve_id)))
                 return out
 
             if need_detail:
@@ -664,9 +700,9 @@ def update_backports_redhat(db_path, releases=("8", "9"),
                         total += len(res)
 
             db.cursor.executemany(
-                "INSERT OR IGNORE INTO backports "
-                "(cve_id, distro, release, package, fixed_version, status) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO backports (cve_id, distro, release, "
+                "package, fixed_version, status, reason, source, citation) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
             db.conn.commit()
@@ -683,6 +719,69 @@ def update_backports_redhat(db_path, releases=("8", "9"),
             )
         db.conn.commit()
     print(f"[+] Red Hat securitydata backfill complete ({total} rows)")
+
+
+# Disposition values accepted in the curated overlay (same vocabulary as the
+# backports.status column). "false_positive" is stored as not_affected so it
+# suppresses; product-scoped false positives stay in checkfix_test's enricher.
+_CURATED_STATUSES = {
+    "fixed", "not_affected", "wont_fix", "fix_deferred", "affected",
+    "false_positive",
+}
+
+
+def load_curated_dispositions(db_path, path):
+    """Merge a curated, version-controlled disposition overlay into backports.
+
+    Highest precedence: loaded LAST with INSERT OR REPLACE so analyst-verified
+    entries win over the auto-sourced OSV/Red Hat data. This is the
+    "improve over time" store — add entries as triage decisions are made.
+
+    JSON shape (see extra/curated_dispositions.json):
+        {"dispositions": [
+            {"cve": "...", "distro": "AlmaLinux", "release": "8",
+             "package": "openssh", "disposition": "not_affected",
+             "fixed_version": null, "reason": "...", "citation": "...",
+             "added_by": "...", "date": "..."}, ...]}
+    """
+    import json as _json
+
+    if not path or not Path(path).is_file():
+        print(f"[*] No curated disposition overlay at {path} — skipping")
+        return
+    with open(path) as f:
+        data = _json.load(f)
+
+    rows = []
+    for e in data.get("dispositions", []):
+        cve = (e.get("cve") or "").strip()
+        distro = (e.get("distro") or "").strip()
+        release = str(e.get("release") or "").strip()
+        package = (e.get("package") or "").strip()
+        disp = (e.get("disposition") or "").strip()
+        if not (cve and distro and release and package) or disp not in _CURATED_STATUSES:
+            print(f"[!] Skipping invalid curated entry: {e}")
+            continue
+        status = "not_affected" if disp == "false_positive" else disp
+        rows.append((
+            cve, distro, release, package, e.get("fixed_version"), status,
+            e.get("reason") or f"Curated: {disp}", "curated",
+            e.get("citation"),
+        ))
+
+    if not rows:
+        print("[*] Curated disposition overlay is empty")
+        return
+    with Database(db_path) as db:
+        db.setup()
+        db.cursor.executemany(
+            "INSERT OR REPLACE INTO backports (cve_id, distro, release, "
+            "package, fixed_version, status, reason, source, citation) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        db.conn.commit()
+    print(f"[+] Curated disposition overlay: {len(rows)} entries applied")
 
 
 def _norm(string):
@@ -1038,7 +1137,7 @@ def update_exploitdb(args):
 def run_update(database, api_key, noscrape=False, full=False,
                backports=False, backports_only=False, ecosystems=None,
                redhat=False, redhat_packages=("openssh",),
-               redhat_releases=("8", "9")):
+               redhat_releases=("8", "9"), curated_path=None):
     """Run the database create/update process.
 
     Args:
@@ -1068,6 +1167,8 @@ def run_update(database, api_key, noscrape=False, full=False,
         if redhat:
             update_backports_redhat(database, releases=redhat_releases,
                                     packages=redhat_packages)
+        if curated_path:
+            load_curated_dispositions(database, curated_path)
         return
 
     if full and database.is_file():
@@ -1106,6 +1207,8 @@ def run_update(database, api_key, noscrape=False, full=False,
         if redhat:
             update_backports_redhat(database, releases=redhat_releases,
                                     packages=redhat_packages)
+        if curated_path:
+            load_curated_dispositions(database, curated_path)
 
 
 if __name__ == "__main__":
@@ -1152,6 +1255,10 @@ if __name__ == "__main__":
         default="8,9",
         help="Comma-separated el releases for the Red Hat backfill (default: 8,9)",
     )
+    parser.add_argument(
+        "--curated",
+        help="Path to a curated disposition overlay JSON (highest precedence)",
+    )
     args = parser.parse_args()
 
     ecosystems = None
@@ -1187,6 +1294,7 @@ if __name__ == "__main__":
             redhat=args.redhat,
             redhat_packages=redhat_packages,
             redhat_releases=redhat_releases,
+            curated_path=args.curated,
         )
     except DatabaseUpdateError as e:
         print(f"[!] {e}")

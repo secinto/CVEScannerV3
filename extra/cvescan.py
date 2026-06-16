@@ -508,66 +508,84 @@ def check_backports(cur, cve_ids, distro, distro_release, cpe_vendor,
         return {}
 
     placeholders = ",".join("?" * len(cve_ids))
+    params = list(cve_ids) + [osv_prefix, osv_release, pkg_name]
     try:
         cur.execute(
-            f"SELECT cve_id, fixed_version, status FROM backports "
-            f"WHERE cve_id IN ({placeholders}) "
+            f"SELECT cve_id, fixed_version, status, reason, source, citation "
+            f"FROM backports WHERE cve_id IN ({placeholders}) "
             f"AND distro = ? AND release = ? AND package = ?",
-            list(cve_ids) + [osv_prefix, osv_release, pkg_name],
+            params,
         )
         rows = cur.fetchall()
     except sql.OperationalError:
-        # Table missing in older/half-built DBs. Surface a one-shot WARN so
-        # silent degradation (every CVE → "unknown") is visible to operators.
-        if not getattr(check_backports, "_warned_missing_table", False):
-            print("[cvescan] WARN: backports table missing from cve.db — "
-                  "all CVEs will be reported as unsuppressed. Rebuild "
-                  "cve.db with backports enabled.", file=sys.stderr)
-            check_backports._warned_missing_table = True
-        return {cve_id: {"status": "unknown", "fixed_version": None}
-                for cve_id in cve_ids}
+        # Either the table is missing, or it predates the reason/source/citation
+        # columns. Retry without them; only fall back to "all unknown" if the
+        # table itself is absent (so older cve.db files still suppress).
+        try:
+            cur.execute(
+                f"SELECT cve_id, fixed_version, status FROM backports "
+                f"WHERE cve_id IN ({placeholders}) "
+                f"AND distro = ? AND release = ? AND package = ?",
+                params,
+            )
+            rows = [(r[0], r[1], r[2], None, None, None) for r in cur.fetchall()]
+        except sql.OperationalError:
+            if not getattr(check_backports, "_warned_missing_table", False):
+                print("[cvescan] WARN: backports table missing from cve.db — "
+                      "all CVEs will be reported as unsuppressed. Rebuild "
+                      "cve.db with backports enabled.", file=sys.stderr)
+                check_backports._warned_missing_table = True
+            return {cve_id: {"status": "unknown", "disposition": "unknown",
+                             "fixed_version": None}
+                    for cve_id in cve_ids}
+
+    def _info(status, disposition, fixed=None, reason=None,
+              source=None, citation=None):
+        d = {"status": status, "disposition": disposition,
+             "fixed_version": fixed}
+        if reason:
+            d["reason"] = reason
+        if source:
+            d["source"] = source
+        if citation:
+            d["citation"] = citation
+        return d
 
     backport_info = {}
-    for cve_id, fixed_version, status in rows:
+    for cve_id, fixed_version, status, reason, source, citation in rows:
+        meta = dict(reason=reason, source=source, citation=citation)
         if status == "fixed" and fixed_version:
-            # Compare installed version against fixed version
+            # Compare installed version against fixed version when known.
             if installed_version:
                 from dpkg_version import compare_dpkg_versions
                 cmp = compare_dpkg_versions(installed_version, fixed_version)
                 if cmp >= 0:
-                    backport_info[cve_id] = {
-                        "status": "patched",
-                        "fixed_version": fixed_version,
-                    }
+                    backport_info[cve_id] = _info(
+                        "patched", "fixed", fixed_version, **meta)
                 else:
-                    backport_info[cve_id] = {
-                        "status": "affected",
-                        "fixed_version": fixed_version,
-                    }
+                    # installed older than the fix → still affected
+                    backport_info[cve_id] = _info(
+                        "affected", "affected", fixed_version, **meta)
             else:
-                # No installed version to compare; mark as patched
-                # since the distro has a fix available
-                backport_info[cve_id] = {
-                    "status": "patched",
-                    "fixed_version": fixed_version,
-                }
+                # No installed version; the distro has a fix → treat as patched.
+                backport_info[cve_id] = _info(
+                    "patched", "fixed", fixed_version, **meta)
         elif status == "not_affected":
-            # Vendor (Red Hat securitydata) states this release is not
-            # vulnerable — suppress as a false positive.
-            backport_info[cve_id] = {
-                "status": "not_affected",
-                "fixed_version": None,
-            }
+            # Vendor states this release is not vulnerable — suppress.
+            backport_info[cve_id] = _info("not_affected", "not_affected", **meta)
+        elif status in ("wont_fix", "fix_deferred"):
+            # Vendor acknowledges the CVE but won't fix / deferred → keep active,
+            # badged with the disposition + reason.
+            backport_info[cve_id] = _info(status, status, **meta)
         else:
-            backport_info[cve_id] = {
-                "status": "affected",
-                "fixed_version": None,
-            }
+            backport_info[cve_id] = _info("affected", "affected", **meta)
 
     # Fill in unknown for CVEs not in backport DB
     for cve_id in cve_ids:
         if cve_id not in backport_info:
-            backport_info[cve_id] = {"status": "unknown", "fixed_version": None}
+            backport_info[cve_id] = {"status": "unknown",
+                                     "disposition": "unknown",
+                                     "fixed_version": None}
 
     return backport_info
 
@@ -597,6 +615,11 @@ def annotate_confidence(cve_list, distro, distro_release, backport_results,
         bp = backport_results.get(cve_id, {})
         bp_status = bp.get("status", "unknown")
         fixed_version = bp.get("fixed_version")
+
+        # Carry the disposition + evidence onto the CVE for the report/frontend.
+        for key in ("disposition", "reason", "source", "citation"):
+            if bp.get(key):
+                cve[key] = bp[key]
 
         # Tier 2: the SSH crypto fingerprint decides the Terrapin CVE directly,
         # overriding banner/backport inference in either direction.
@@ -632,6 +655,14 @@ def annotate_confidence(cve_list, distro, distro_release, backport_results,
             # affected") — suppress as a false positive.
             cve["confidence"] = "DISTRO_NOT_AFFECTED"
             patched.append(cve)
+        elif bp_status == "wont_fix":
+            # Vendor acknowledges but won't fix — surfaced, badged, kept active.
+            cve["confidence"] = "VENDOR_WONT_FIX"
+            active.append(cve)
+        elif bp_status == "fix_deferred":
+            # Vendor acknowledges, fix pending — surfaced, badged, kept active.
+            cve["confidence"] = "VENDOR_FIX_DEFERRED"
+            active.append(cve)
         elif bp_status == "affected":
             cve["confidence"] = "UPSTREAM_MATCH"
             active.append(cve)
