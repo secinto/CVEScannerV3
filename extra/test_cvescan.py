@@ -35,11 +35,23 @@ from cvescan import (
 from distro import (
     detect_debian_release,
     detect_distro_from_banner,
+    detect_rhel_release,
     detect_ubuntu_release,
     get_osv_ecosystem,
     get_osv_ecosystem_parts,
 )
 from dpkg_version import compare_dpkg_versions, parse_dpkg_version
+from ssh_fingerprint import (
+    TERRAPIN_CVE,
+    analyze_ssh_crypto,
+    crypto_from_service,
+)
+from redhat_backport import (
+    is_not_affected,
+    rh_disposition,
+    rh_fix_state,
+    rh_fixed_version,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -945,6 +957,236 @@ class TestDetectDistroService(unittest.TestCase):
         d, r = _detect_distro(svc)
         self.assertIsNone(d)
         self.assertIsNone(r)
+
+
+# ---------------------------------------------------------------------------
+# Tests: RHEL-family inference (Tier 1)
+# ---------------------------------------------------------------------------
+
+class TestRhelDistroDetection(unittest.TestCase):
+    def test_bare_rhel_ssh_el8(self):
+        info = detect_distro_from_banner("SSH-2.0-OpenSSH_8.0")
+        self.assertIsNotNone(info)
+        self.assertEqual(info["distro"], "rhel")
+        self.assertEqual(info["distro_release"], "8")
+
+    def test_bare_rhel_ssh_el9(self):
+        info = detect_distro_from_banner("SSH-2.0-OpenSSH_8.7")
+        self.assertEqual(info["distro_release"], "9")
+
+    def test_bare_rhel_ssh_el7(self):
+        info = detect_distro_from_banner("SSH-2.0-OpenSSH_7.4")
+        self.assertEqual(info["distro_release"], "7")
+
+    def test_portable_suffix_not_rhel(self):
+        # Upstream/Debian/Ubuntu carry "pN"; that is not the RHEL banner shape.
+        self.assertIsNone(detect_distro_from_banner("SSH-2.0-OpenSSH_8.0p1"))
+
+    def test_distro_tag_blocks_rhel_inference(self):
+        # A Debian-/Ubuntu- tag must prevent RHEL misclassification — better to
+        # return nothing than to wrongly map a tagged host to el8.
+        self.assertIsNone(detect_distro_from_banner("SSH-2.0-OpenSSH_8.0 Debian-1"))
+
+    def test_non_frozen_version_not_rhel(self):
+        # 8.5 is not a version RHEL ever froze for an el major.
+        self.assertIsNone(detect_distro_from_banner("SSH-2.0-OpenSSH_8.5"))
+
+    def test_rhel_release_map(self):
+        self.assertEqual(detect_rhel_release("8.0"), "8")
+        self.assertIsNone(detect_rhel_release("8.5"))
+
+    def test_rhel_osv_ecosystem(self):
+        self.assertEqual(get_osv_ecosystem("rhel", "8"), "AlmaLinux:8")
+        self.assertEqual(get_osv_ecosystem("rhel", "9"), "AlmaLinux:9")
+        prefix, release = get_osv_ecosystem_parts("rhel", "8")
+        self.assertEqual((prefix, release), ("AlmaLinux", "8"))
+
+
+# ---------------------------------------------------------------------------
+# Tests: SSH crypto fingerprint (Tier 2)
+# ---------------------------------------------------------------------------
+
+class TestSshFingerprint(unittest.TestCase):
+    # Algorithm sets observed live on 3.69.172.222 (cPanel/el8, OpenSSH_8.0).
+    PATCHED_KEX = [
+        "curve25519-sha256", "ecdh-sha2-nistp256",
+        "diffie-hellman-group14-sha256", "kex-strict-s-v00@openssh.com",
+    ]
+    ENC = ["chacha20-poly1305@openssh.com", "aes256-ctr", "aes256-gcm@openssh.com"]
+    MAC = ["umac-128-etm@openssh.com", "hmac-sha2-256-etm@openssh.com"]
+
+    def test_strict_kex_detected(self):
+        ev = analyze_ssh_crypto(self.PATCHED_KEX, self.ENC, self.MAC)
+        self.assertTrue(ev["has_crypto_evidence"])
+        self.assertTrue(ev["strict_kex"])
+        self.assertTrue(ev["backport_corroborated"])
+        self.assertFalse(ev["terrapin_vulnerable"])
+
+    def test_terrapin_vulnerable_without_strict_kex(self):
+        kex = ["curve25519-sha256", "ecdh-sha2-nistp256"]  # no strict-kex
+        ev = analyze_ssh_crypto(kex, self.ENC, self.MAC)
+        self.assertFalse(ev["strict_kex"])
+        self.assertTrue(ev["terrapin_vulnerable"])
+
+    def test_string_input_normalised(self):
+        ev = analyze_ssh_crypto("curve25519-sha256,kex-strict-s-v00@openssh.com")
+        self.assertTrue(ev["strict_kex"])
+
+    def test_no_crypto_evidence(self):
+        ev = analyze_ssh_crypto()
+        self.assertFalse(ev["has_crypto_evidence"])
+
+    def test_crypto_from_service_absent(self):
+        self.assertIsNone(crypto_from_service({"product": "openssh"}))
+
+    def test_crypto_from_service_present(self):
+        ev = crypto_from_service({"ssh_kex_algorithms": self.PATCHED_KEX})
+        self.assertTrue(ev["strict_kex"])
+
+
+# ---------------------------------------------------------------------------
+# Tests: Tier 2 crypto-aware confidence annotation
+# ---------------------------------------------------------------------------
+
+class TestCryptoAnnotateConfidence(unittest.TestCase):
+    def _cves(self, *ids):
+        return [{"cve_id": c, "cvss_v3": 7.0, "cvss_v2": None} for c in ids]
+
+    def test_terrapin_patched_by_strict_kex(self):
+        # backport DB says unknown, but strict KEX proves it's mitigated.
+        bp = {TERRAPIN_CVE: {"status": "unknown", "fixed_version": None}}
+        crypto = {"has_crypto_evidence": True, "strict_kex": True,
+                  "backport_corroborated": True, "terrapin_vulnerable": False}
+        active, patched = annotate_confidence(
+            self._cves(TERRAPIN_CVE), "rhel", "8", bp, crypto=crypto)
+        self.assertEqual(len(patched), 1)
+        self.assertEqual(patched[0]["crypto_evidence"], "strict_kex_present")
+
+    def test_terrapin_kept_active_when_vulnerable(self):
+        # backport DB claims patched, but crypto proves the host is exploitable:
+        # must NOT be suppressed.
+        bp = {TERRAPIN_CVE: {"status": "patched", "fixed_version": "0:8.0p1-1.el8"}}
+        crypto = {"has_crypto_evidence": True, "strict_kex": False,
+                  "backport_corroborated": False, "terrapin_vulnerable": True}
+        active, patched = annotate_confidence(
+            self._cves(TERRAPIN_CVE), "rhel", "8", bp, crypto=crypto)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["crypto_evidence"], "terrapin_vulnerable")
+        self.assertEqual(len(patched), 0)
+
+    def test_backport_corroborated_flag(self):
+        bp = {"CVE-2020-1": {"status": "patched", "fixed_version": "0:8.0p1-1.el8"}}
+        crypto = {"has_crypto_evidence": True, "strict_kex": True,
+                  "backport_corroborated": True, "terrapin_vulnerable": False}
+        active, patched = annotate_confidence(
+            self._cves("CVE-2020-1"), "rhel", "8", bp, crypto=crypto)
+        self.assertEqual(patched[0]["crypto_evidence"], "backport_corroborated")
+
+    def test_no_crypto_unchanged(self):
+        # crypto=None → identical to legacy behaviour.
+        bp = {"CVE-2020-1": {"status": "patched", "fixed_version": "1.0-1"}}
+        active, patched = annotate_confidence(
+            self._cves("CVE-2020-1"), "rhel", "8", bp)
+        self.assertEqual(patched[0]["confidence"], "LIKELY_PATCHED")
+        self.assertNotIn("crypto_evidence", patched[0])
+
+
+# ---------------------------------------------------------------------------
+# Tests: Red Hat securitydata backfill parse helpers
+# ---------------------------------------------------------------------------
+
+class TestRedhatBackport(unittest.TestCase):
+    def test_fixed_version_el8(self):
+        self.assertEqual(
+            rh_fixed_version(["openssh-0:8.0p1-10.el8"], "openssh", "8"),
+            "8.0p1-10.el8")
+
+    def test_fixed_version_el8_zstream(self):
+        self.assertEqual(
+            rh_fixed_version(["openssh-0:8.0p1-19.el8_8"], "openssh", "8"),
+            "8.0p1-19.el8_8")
+
+    def test_fixed_version_wrong_release(self):
+        # an el8 build must not satisfy a release=9 query
+        self.assertIsNone(
+            rh_fixed_version(["openssh-0:8.0p1-10.el8"], "openssh", "9"))
+
+    def test_fixed_version_el9(self):
+        self.assertEqual(
+            rh_fixed_version(["openssh-0:8.7p1-38.el9"], "openssh", "9"),
+            "8.7p1-38.el9")
+
+    def test_fixed_version_subpackage(self):
+        # subpackages share the source RPM EVR and are accepted
+        self.assertEqual(
+            rh_fixed_version(["openssh-server-0:8.0p1-10.el8"], "openssh", "8"),
+            "8.0p1-10.el8")
+
+    def test_fixed_version_other_distro(self):
+        self.assertIsNone(
+            rh_fixed_version(["openssh-main-10.3p1-2.hum1"], "openssh", "8"))
+        self.assertIsNone(rh_fixed_version([], "openssh", "8"))
+
+    def test_fix_state_el8(self):
+        ps = [{"product_name": "Red Hat Enterprise Linux 8",
+               "fix_state": "Not affected", "package_name": "openssh",
+               "cpe": "cpe:/o:redhat:enterprise_linux:8"}]
+        self.assertEqual(rh_fix_state(ps, "openssh", "8"), "Not affected")
+        self.assertIsNone(rh_fix_state(ps, "openssh", "9"))
+        self.assertIsNone(rh_fix_state(None, "openssh", "8"))
+
+    def test_is_not_affected(self):
+        self.assertTrue(is_not_affected("Not affected"))
+        self.assertTrue(is_not_affected("not affected"))
+        self.assertFalse(is_not_affected("Will not fix"))
+        self.assertFalse(is_not_affected("Fix deferred"))
+        self.assertFalse(is_not_affected(None))
+
+    def test_disposition_mapping(self):
+        self.assertEqual(rh_disposition("Not affected"), "not_affected")
+        self.assertEqual(rh_disposition("Will not fix"), "wont_fix")
+        self.assertEqual(rh_disposition("Out of support scope"), "wont_fix")
+        self.assertEqual(rh_disposition("Fix deferred"), "fix_deferred")
+        self.assertEqual(rh_disposition("Affected"), "affected")
+        self.assertIsNone(rh_disposition("Under investigation"))
+        self.assertIsNone(rh_disposition(None))
+
+
+class TestNotAffectedConfidence(unittest.TestCase):
+    def test_not_affected_suppressed(self):
+        cves = [{"cve_id": "CVE-2019-16905", "cvss_v3": 8.8, "cvss_v2": None}]
+        bp = {"CVE-2019-16905": {"status": "not_affected", "fixed_version": None}}
+        active, patched = annotate_confidence(cves, "rhel", "8", bp)
+        self.assertEqual(len(active), 0)
+        self.assertEqual(len(patched), 1)
+        self.assertEqual(patched[0]["confidence"], "DISTRO_NOT_AFFECTED")
+
+    def test_wont_fix_active_badged(self):
+        cves = [{"cve_id": "CVE-2023-51767", "cvss_v3": 7.0, "cvss_v2": None}]
+        bp = {"CVE-2023-51767": {"status": "wont_fix", "disposition": "wont_fix",
+                                 "fixed_version": None,
+                                 "reason": "Red Hat: Will not fix (el8)",
+                                 "source": "redhat-securitydata",
+                                 "citation": "https://access.redhat.com/security/cve/CVE-2023-51767"}}
+        active, patched = annotate_confidence(cves, "rhel", "8", bp)
+        self.assertEqual(len(patched), 0)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["confidence"], "VENDOR_WONT_FIX")
+        # disposition metadata carried onto the CVE for the report/frontend
+        self.assertEqual(active[0]["disposition"], "wont_fix")
+        self.assertEqual(active[0]["reason"], "Red Hat: Will not fix (el8)")
+        self.assertEqual(active[0]["source"], "redhat-securitydata")
+        self.assertTrue(active[0]["citation"].endswith("CVE-2023-51767"))
+
+    def test_fix_deferred_active_badged(self):
+        cves = [{"cve_id": "CVE-2025-32728", "cvss_v3": 4.3, "cvss_v2": None}]
+        bp = {"CVE-2025-32728": {"status": "fix_deferred",
+                                 "disposition": "fix_deferred",
+                                 "fixed_version": None}}
+        active, patched = annotate_confidence(cves, "rhel", "8", bp)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["confidence"], "VENDOR_FIX_DEFERRED")
+        self.assertEqual(active[0]["disposition"], "fix_deferred")
 
 
 # ---------------------------------------------------------------------------

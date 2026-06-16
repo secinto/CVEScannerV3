@@ -26,8 +26,27 @@ UBUNTU_RELEASES = {
     "kinetic": ("kinetic", "22.10"),
 }
 
+# RHEL family freezes exactly one OpenSSH version per major release and never
+# bumps the version string — fixes are backported as RPM release bumps
+# (openssh-8.0p1-19.el8 → -29.el8_10). So the bare upstream version in the SSH
+# banner deterministically identifies the el major. Banner has no portable
+# "pN" suffix and no Debian-/Ubuntu- tag, e.g. "SSH-2.0-OpenSSH_8.0".
+#   el7 → 7.4,  el8 → 8.0,  el9 → 8.7,  el10 → 9.9
+RHEL_OPENSSH_RELEASES = {
+    "7.4": "7",
+    "8.0": "8",
+    "8.7": "9",
+    "9.9": "10",
+}
+
 # Map (distro, codename) → OSV ecosystem string
 RELEASE_TO_OSV = {
+    # RHEL family: AlmaLinux is the OSV proxy bucket. CloudLinux/Rocky/CentOS
+    # and RHEL itself are el-ABI-identical and ship the same openssh-*.elN RPMs;
+    # AlmaLinux's OSV feed (ALSA) carries the el fixed-version data and, unlike
+    # the "Red Hat" OSV bucket, matches plain "openssh" version queries.
+    ("rhel", "8"): "AlmaLinux:8",
+    ("rhel", "9"): "AlmaLinux:9",
     ("debian", "trixie"): "Debian:13",
     ("debian", "bookworm"): "Debian:12",
     ("debian", "bullseye"): "Debian:11",
@@ -51,6 +70,12 @@ _RE_DEBIAN_SSH = re.compile(
 )
 _RE_UBUNTU_SSH = re.compile(
     r"OpenSSH_[\d.]+p\d+\s+Ubuntu-(\S+)", re.IGNORECASE
+)
+# RHEL-family SSH banner: bare "OpenSSH_<maj>.<min>" with NO portable "pN"
+# suffix and NO distro tag. The absence of "pN" is itself the RHEL tell —
+# upstream portable always carries it, Debian/Ubuntu carry it plus a tag.
+_RE_BARE_SSH = re.compile(
+    r"OpenSSH_(\d+\.\d+)(p\d+)?(.*)$", re.IGNORECASE
 )
 # HTTP Server header patterns
 _RE_RHEL_HTTP = re.compile(
@@ -84,6 +109,15 @@ def detect_ubuntu_release(revision):
     return None
 
 
+def detect_rhel_release(openssh_version):
+    """Map a bare OpenSSH version to a RHEL/el major release.
+
+    E.g. '8.0' → '8'. Returns None for versions RHEL never shipped (which
+    therefore are not a backported-el build).
+    """
+    return RHEL_OPENSSH_RELEASES.get(openssh_version)
+
+
 def detect_distro_from_banner(banner):
     """Parse a service banner to detect distro information.
 
@@ -114,6 +148,23 @@ def detect_distro_from_banner(banner):
             "distro_release": codename,
             "package_revision": revision,
         }
+
+    # RHEL-family SSH banner: bare "OpenSSH_8.0" — no portable "pN", no distro
+    # tag, and the version is one RHEL actually froze for an el major. The
+    # Debian/Ubuntu SSH checks above already consumed any tagged banner, so a
+    # match here is a strong el-family signal. distro_release is the el major;
+    # callers may corroborate with the SSH crypto fingerprint (Tier 2).
+    m = _RE_BARE_SSH.search(banner)
+    if m and not m.group(2):  # group(2) is the "pN" suffix — must be absent
+        tail = m.group(3) or ""
+        if not re.search(r"Debian-|Ubuntu-", tail, re.IGNORECASE):
+            el_major = detect_rhel_release(m.group(1))
+            if el_major:
+                return {
+                    "distro": "rhel",
+                    "distro_release": el_major,
+                    "package_revision": None,
+                }
 
     # RHEL HTTP banner: Apache/2.4.37 (Red Hat Enterprise Linux)
     if _RE_RHEL_HTTP.search(banner):
