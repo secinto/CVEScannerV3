@@ -12,5 +12,18 @@
     "added_by": "analyst",
     "date": "2026-06-16"
   },
-  "dispositions": []
+  "dispositions": [
+    {
+      "cve": "CVE-2023-51767",
+      "distro": "AlmaLinux",
+      "release": "8",
+      "package": "openssh",
+      "disposition": "not_affected",
+      "fixed_version": null,
+      "reason": "No el8 backport (Red Hat Will-not-fix). Not remotely exploitable: the authentication bypass requires a local Rowhammer/DRAM bit-flip primitive (CVSS AV:L/AC:H/PR:L) - an unprivileged attacker already executing code on the same physical host, with Rowhammer-susceptible (non-ECC/unmitigated) DRAM, landing a precise single-bit flip on the 'authenticated' integer in mm_answer_authpassword. Unreachable by an external unauthenticated scan; software fixes are ineffective by design (hardware fault, disputed upstream). Banner-version match only; CVSS 7.0 overstates remote risk. Downgraded for external/PCI context per accepted-risk triage.",
+      "citation": "https://access.redhat.com/security/cve/CVE-2023-51767",
+      "added_by": "analyst",
+      "date": "2026-06-17"
+    }
+  ]
 }
