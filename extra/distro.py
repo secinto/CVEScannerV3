@@ -39,6 +39,23 @@ RHEL_OPENSSH_RELEASES = {
     "9.9": "10",
 }
 
+# RHEL family also freezes the Apache httpd version per major and backports
+# fixes as RPM release bumps. BUT, unlike OpenSSH, httpd is periodically
+# *rebased* within el9/el10 (el9 has shipped 2.4.51 … 2.4.62; el10 is 2.4.63),
+# and some versions (e.g. 2.4.62) appear in more than one major — so the banner
+# version is NOT a collision-free el discriminator there. Only el7 (2.4.6) and
+# el8 (2.4.37) are frozen-for-life with a unique version, so only those are
+# mapped. el9/el10 httpd hosts resolve to distro=rhel with release=None (no
+# false suppression); their release is meant to be pinned later via
+# cross-service host-level OS propagation, not the httpd banner alone.
+# Unlike OpenSSH there is no "pN"-style RHEL tell in an Apache banner, so this
+# map is only consulted when an el-family Server-tag is present (see
+# _RE_RHEL_HTTP) — never on a bare "Apache/x.y.z".
+RHEL_HTTPD_RELEASES = {
+    "2.4.6": "7",
+    "2.4.37": "8",
+}
+
 # Map (distro, codename) → OSV ecosystem string
 RELEASE_TO_OSV = {
     # RHEL family: AlmaLinux is the OSV proxy bucket. CloudLinux/Rocky/CentOS
@@ -84,11 +101,20 @@ _RE_BARE_SSH = re.compile(
     r"OpenSSH_(\d+\.\d+)(p\d+)?(.*)$", re.IGNORECASE
 )
 # HTTP Server header patterns
+# el-family Server tag: Red Hat itself plus the el-ABI-identical rebuilds
+# (CentOS, CloudLinux, AlmaLinux, Rocky, Oracle Linux) that ship the same
+# httpd-*.elN RPMs and so share the AlmaLinux:N backport bucket.
 _RE_RHEL_HTTP = re.compile(
-    r"\(Red\s+Hat(?:\s+Enterprise\s+Linux)?\)", re.IGNORECASE
+    r"\((?:Red\s+Hat(?:\s+Enterprise\s+Linux)?"
+    r"|CentOS|CloudLinux|AlmaLinux|Rocky(?:\s+Linux)?|Oracle(?:\s+Linux)?)\)",
+    re.IGNORECASE,
 )
 _RE_DEBIAN_HTTP = re.compile(r"\(Debian\)", re.IGNORECASE)
 _RE_UBUNTU_HTTP = re.compile(r"\(Ubuntu\)", re.IGNORECASE)
+# Apache version inside a Server header or synthesized banner. Tolerates both
+# the HTTP Server-header shape "Apache/2.4.37 ..." and nmap's product-based
+# synthesis "Apache httpd/2.4.37 ..." (nmap reports product="Apache httpd").
+_RE_APACHE_VER = re.compile(r"Apache(?:\s+httpd)?/(\d+\.\d+\.\d+)", re.IGNORECASE)
 
 
 def detect_debian_release(revision):
@@ -122,6 +148,17 @@ def detect_rhel_release(openssh_version):
     therefore are not a backported-el build).
     """
     return RHEL_OPENSSH_RELEASES.get(openssh_version)
+
+
+def detect_rhel_httpd_release(httpd_version):
+    """Map a frozen Apache httpd version to a RHEL/el major release.
+
+    E.g. '2.4.37' → '8'. Returns None for versions that are not a unique,
+    frozen-for-life el identifier (el9/el10 rebase httpd and are intentionally
+    not mapped — see RHEL_HTTPD_RELEASES). Only meaningful when the banner
+    already carries an el-family Server tag.
+    """
+    return RHEL_HTTPD_RELEASES.get(httpd_version)
 
 
 def detect_distro_from_banner(banner):
@@ -172,11 +209,20 @@ def detect_distro_from_banner(banner):
                     "package_revision": None,
                 }
 
-    # RHEL HTTP banner: Apache/2.4.37 (Red Hat Enterprise Linux)
+    # RHEL-family HTTP banner: Apache/2.4.37 (Red Hat Enterprise Linux),
+    # ... (CentOS) / (CloudLinux) / (AlmaLinux) / (Rocky Linux) / (Oracle Linux).
+    # The el-family Server tag fixes the distro; a frozen-for-life httpd version
+    # (el7 2.4.6 / el8 2.4.37) additionally pins the el major. el9/el10 httpd is
+    # rebased so its version is left unmapped → release stays None (no
+    # suppression) until cross-service OS propagation supplies it.
     if _RE_RHEL_HTTP.search(banner):
+        el_major = None
+        vm = _RE_APACHE_VER.search(banner)
+        if vm:
+            el_major = detect_rhel_httpd_release(vm.group(1))
         return {
             "distro": "rhel",
-            "distro_release": None,
+            "distro_release": el_major,
             "package_revision": None,
         }
 

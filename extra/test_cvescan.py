@@ -35,6 +35,7 @@ from cvescan import (
 from distro import (
     detect_debian_release,
     detect_distro_from_banner,
+    detect_rhel_httpd_release,
     detect_rhel_release,
     detect_ubuntu_release,
     get_osv_ecosystem,
@@ -1005,6 +1006,62 @@ class TestRhelDistroDetection(unittest.TestCase):
         self.assertEqual((prefix, release), ("AlmaLinux", "8"))
         self.assertEqual(get_osv_ecosystem_parts("rhel", "7"), ("AlmaLinux", "7"))
         self.assertEqual(get_osv_ecosystem_parts("rhel", "10"), ("AlmaLinux", "10"))
+
+
+# ---------------------------------------------------------------------------
+# Tests: RHEL-family Apache httpd detection (Tier 1, HTTP banner)
+# ---------------------------------------------------------------------------
+
+class TestRhelHttpdDetection(unittest.TestCase):
+    def test_httpd_release_map(self):
+        self.assertEqual(detect_rhel_httpd_release("2.4.6"), "7")
+        self.assertEqual(detect_rhel_httpd_release("2.4.37"), "8")
+        # Rebased/ambiguous el9/el10 versions are intentionally unmapped.
+        self.assertIsNone(detect_rhel_httpd_release("2.4.62"))
+        self.assertIsNone(detect_rhel_httpd_release("2.4.57"))
+
+    def test_el8_redhat_tag_with_frozen_version(self):
+        d = detect_distro_from_banner(
+            "Apache/2.4.37 (Red Hat Enterprise Linux) OpenSSL/1.1.1k")
+        self.assertEqual(d["distro"], "rhel")
+        self.assertEqual(d["distro_release"], "8")
+
+    def test_el7_centos_tag(self):
+        d = detect_distro_from_banner("Apache/2.4.6 (CentOS)")
+        self.assertEqual((d["distro"], d["distro_release"]), ("rhel", "7"))
+
+    def test_el_family_rebuild_tags(self):
+        for tag in ("AlmaLinux", "Rocky Linux", "CloudLinux", "Oracle Linux"):
+            d = detect_distro_from_banner(f"Apache/2.4.37 ({tag})")
+            self.assertEqual((d["distro"], d["distro_release"]), ("rhel", "8"),
+                             msg=tag)
+
+    def test_rebased_version_no_release(self):
+        # el-family tag fixes the distro, but a rebased httpd version must NOT
+        # be turned into a release guess (no false suppression).
+        d = detect_distro_from_banner("Apache/2.4.62 (Red Hat)")
+        self.assertEqual(d["distro"], "rhel")
+        self.assertIsNone(d["distro_release"])
+
+    def test_tag_without_version(self):
+        d = detect_distro_from_banner("Apache (CloudLinux)")
+        self.assertEqual(d["distro"], "rhel")
+        self.assertIsNone(d["distro_release"])
+
+    def test_debian_apache_not_rhel(self):
+        d = detect_distro_from_banner("Apache/2.4.57 (Debian)")
+        self.assertEqual(d["distro"], "debian")
+
+    def test_bare_apache_no_distro(self):
+        # No el-family tag → no RHEL inference from an Apache version alone.
+        self.assertIsNone(detect_distro_from_banner("Apache/2.4.37"))
+
+    def test_nmap_product_banner_shape(self):
+        # The checkfix_test producer synthesizes the banner from nmap's
+        # product field, which is "Apache httpd" — the version must still parse.
+        d = detect_distro_from_banner(
+            "Apache httpd/2.4.37 (Red Hat Enterprise Linux)")
+        self.assertEqual((d["distro"], d["distro_release"]), ("rhel", "8"))
 
 
 # ---------------------------------------------------------------------------
