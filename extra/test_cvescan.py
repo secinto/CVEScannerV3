@@ -998,8 +998,13 @@ class TestRhelDistroDetection(unittest.TestCase):
     def test_rhel_osv_ecosystem(self):
         self.assertEqual(get_osv_ecosystem("rhel", "8"), "AlmaLinux:8")
         self.assertEqual(get_osv_ecosystem("rhel", "9"), "AlmaLinux:9")
+        # el7 (Red-Hat-backfill-only) and el10 also resolve to a lookup bucket.
+        self.assertEqual(get_osv_ecosystem("rhel", "7"), "AlmaLinux:7")
+        self.assertEqual(get_osv_ecosystem("rhel", "10"), "AlmaLinux:10")
         prefix, release = get_osv_ecosystem_parts("rhel", "8")
         self.assertEqual((prefix, release), ("AlmaLinux", "8"))
+        self.assertEqual(get_osv_ecosystem_parts("rhel", "7"), ("AlmaLinux", "7"))
+        self.assertEqual(get_osv_ecosystem_parts("rhel", "10"), ("AlmaLinux", "10"))
 
 
 # ---------------------------------------------------------------------------

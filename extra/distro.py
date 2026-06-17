@@ -45,8 +45,14 @@ RELEASE_TO_OSV = {
     # and RHEL itself are el-ABI-identical and ship the same openssh-*.elN RPMs;
     # AlmaLinux's OSV feed (ALSA) carries the el fixed-version data and, unlike
     # the "Red Hat" OSV bucket, matches plain "openssh" version queries.
+    # el7 has no AlmaLinux OSV feed (AlmaLinux starts at 8) — the "AlmaLinux:7"
+    # bucket is a lookup key only, populated solely by the Red Hat securitydata
+    # backfill (which writes distro="AlmaLinux", release="7"). Do NOT add it to
+    # the OSV download ecosystems. el10 does have an AlmaLinux feed.
+    ("rhel", "7"): "AlmaLinux:7",
     ("rhel", "8"): "AlmaLinux:8",
     ("rhel", "9"): "AlmaLinux:9",
+    ("rhel", "10"): "AlmaLinux:10",
     ("debian", "trixie"): "Debian:13",
     ("debian", "bookworm"): "Debian:12",
     ("debian", "bullseye"): "Debian:11",
