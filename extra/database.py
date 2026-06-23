@@ -24,6 +24,7 @@
 import argparse
 import html
 import os
+import random
 import re
 import sqlite3 as sql
 import sys
@@ -42,8 +43,19 @@ from pyrate_limiter import Limiter, RequestRate
 from tqdm import tqdm
 
 
-# 50 requests in a 30-seconds window
-LIMITER = Limiter(RequestRate(48, 30))
+# NVD allows 50 requests per rolling 30s window with an API key. A fixed-window
+# rate this close to the ceiling can momentarily burst over it (and thus draw
+# 429s), so default a little below and let it be tuned via the environment.
+NVD_RATE_PER_30S = int(os.getenv("NVD_RATE_PER_30S", "40"))
+LIMITER = Limiter(RequestRate(NVD_RATE_PER_30S, 30))
+# NVD's edge (Cloudflare) intermittently answers with HTTP 429 or an HTML 503
+# "No server is available" page instead of JSON. Retry transient failures with
+# exponential backoff so a blip doesn't silently drop a whole batch of records.
+NVD_MAX_RETRIES = int(os.getenv("NVD_MAX_RETRIES", "6"))
+NVD_BACKOFF_BASE = float(os.getenv("NVD_BACKOFF_BASE", "2.0"))
+NVD_BACKOFF_CAP = float(os.getenv("NVD_BACKOFF_CAP", "120.0"))
+# Status codes worth retrying (transient): rate-limit + the 5xx family.
+NVD_RETRY_STATUS = (429, 500, 502, 503, 504)
 UA = UserAgent()
 KEY = ""
 RE = {
@@ -848,23 +860,64 @@ class PopulateDBThread(Thread):
                 ) from exc
 
 
+def _nvd_backoff_sleep(seconds):
+    """Sleep `seconds` (capped) plus jitter to desynchronise retrying threads."""
+    delay = min(max(seconds, 0.0), NVD_BACKOFF_CAP)
+    time.sleep(delay + random.uniform(0, min(delay, 5.0)))
+
+
+def nvd_get_json(url, headers=None, timeout=120, max_retries=NVD_MAX_RETRIES):
+    """GET `url` and return parsed JSON, retrying transient NVD failures.
+
+    Retries on connection/timeout errors, 429/5xx responses, and non-JSON
+    bodies (NVD serves an HTML 503 page under load), honouring a numeric
+    Retry-After header when present. Raises DatabaseUpdateError once the final
+    attempt fails so callers can decide whether to drop the batch or abort.
+
+    This exists because NVD's edge intermittently rejects a large fraction of
+    requests; without per-request retries those batches were silently dropped,
+    producing a half-populated database that still "succeeded".
+    """
+    if headers is None:
+        headers = {"apiKey": KEY}
+    last_err = "unknown error"
+    for attempt in range(max_retries):
+        try:
+            resp = httpx.get(url, timeout=timeout, headers=headers)
+        except httpx.HTTPError as exc:
+            last_err = f"transport error: {exc}"
+        else:
+            if resp.status_code == 200:
+                try:
+                    return resp.json()
+                except ValueError as exc:
+                    # 200 with an unparseable body — treat as transient.
+                    last_err = f"non-JSON 200 body: {exc}"
+            elif resp.status_code in NVD_RETRY_STATUS:
+                last_err = f"HTTP {resp.status_code}"
+                retry_after = resp.headers.get("Retry-After", "")
+                if retry_after.isdigit():
+                    _nvd_backoff_sleep(float(retry_after))
+                    continue
+            else:
+                # Non-transient (e.g. 403/404) — no point retrying.
+                raise DatabaseUpdateError(
+                    f"NVD API returned HTTP {resp.status_code} for {url}: "
+                    f"{resp.text[:200]}"
+                )
+        if attempt < max_retries - 1:
+            _nvd_backoff_sleep(NVD_BACKOFF_BASE * (2 ** attempt))
+    raise DatabaseUpdateError(
+        f"NVD request failed after {max_retries} attempts ({last_err}): {url}"
+    )
+
+
 @LIMITER.ratelimit("identity", delay=True)
 def query_api(args):
     try:
         url, bar, thread_objs, batch, populate = args
         _, ev_ins, queue = thread_objs
-        try:
-            resp = httpx.get(url, timeout=120, headers={"apiKey": KEY})
-        except httpx.TimeoutException:
-            print(traceback.format_exc())
-            return
-        try:
-            data = resp.json()
-        except Exception as exc:
-            print(traceback.format_exc())
-            raise DatabaseUpdateError(
-                "Failed to parse NVD API response"
-            ) from exc
+        data = nvd_get_json(url, {"apiKey": KEY})
         if "cpes" in url:
             idy = 0
             for prod in data["products"]:
@@ -952,7 +1005,10 @@ def query_api(args):
                                 queue.put((3, (exp_id,)))
                                 queue.put((7, (cve_id, exp_id)))
     except Exception:
-        print(url)
+        # Retries inside nvd_get_json are exhausted: drop this batch rather than
+        # abort the whole run. The caller's completeness check (ingested vs
+        # reported totals) is the backstop that rejects a partial rebuild.
+        print(f"[!] Dropping batch after retries: {url}")
         print(traceback.format_exc())
     ev_ins.set()
     bar.update(batch)
@@ -973,33 +1029,14 @@ def update_db(args, thread_objs, populate=False):
 
     api_headers = {"apiKey": KEY}
     print("[*] Retrieving CVEs/CPEs metadata...")
-    try:
-        resp = httpx.get(
-            f"{URL['nvd'].format('cpes', 0)}&resultsPerPage=1{extra}",
-            timeout=120, headers=api_headers,
-        )
-    except httpx.HTTPError as e:
-        raise DatabaseUpdateError(f"HTTP error retrieving CPE metadata: {e}") from e
-    if resp.status_code != 200:
-        raise DatabaseUpdateError(
-            f"Error retrieving information from NVD API: {resp.text}"
-        )
-    try:
-        cpes = resp.json()["totalResults"]
-    except Exception as e:
-        raise DatabaseUpdateError(
-            f"Failed to parse CPE metadata response: {e}"
-        ) from e
-    resp = httpx.get(
-        f"{URL['nvd'].format('cves', 0)}&resultsPerPage=1{extra}",
-        timeout=120, headers=api_headers,
-    )
-    try:
-        cves = resp.json()["totalResults"]
-    except Exception as e:
-        raise DatabaseUpdateError(
-            f"Failed to parse CVE metadata response: {e}"
-        ) from e
+    # Resilient: the preflight previously aborted the whole run on a single
+    # transient 503/429. nvd_get_json retries before giving up.
+    cpes = nvd_get_json(
+        f"{URL['nvd'].format('cpes', 0)}&resultsPerPage=1{extra}", api_headers
+    )["totalResults"]
+    cves = nvd_get_json(
+        f"{URL['nvd'].format('cves', 0)}&resultsPerPage=1{extra}", api_headers
+    )["totalResults"]
     print(f"[+] Metadata: {cpes} CPEs | {cves} CVEs")
     cve_q, cpe_q = -(-cves // CONST["cve"]), -(-cpes // CONST["cpe"])
     cve_l = cves % CONST["cve"] or CONST["cve"]
