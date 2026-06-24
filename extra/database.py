@@ -35,6 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Thread
+from urllib.parse import quote as _urlquote
 
 import httpx
 from fake_useragent import UserAgent
@@ -470,7 +471,6 @@ def update_backports_osv(db_path, ecosystems=None):
     import io
     import json as _json
     import zipfile
-    from urllib.parse import quote
 
     if ecosystems is None:
         ecosystems = DEFAULT_ECOSYSTEMS
@@ -492,7 +492,7 @@ def update_backports_osv(db_path, ecosystems=None):
             if zf is None:
                 # Preserve ":" (a literal segment in OSV bucket keys), encode
                 # spaces ("Rocky Linux" → "Rocky%20Linux").
-                url = OSV_BULK_URL.format(ecosystem=quote(bulk_name, safe=":"))
+                url = OSV_BULK_URL.format(ecosystem=_urlquote(bulk_name, safe=":"))
                 print(f"[*] Downloading OSV data for {bulk_name}...")
                 try:
                     resp = httpx.get(url, timeout=300, follow_redirects=True)
@@ -1021,7 +1021,8 @@ def update_db(args, thread_objs, populate=False):
         with Database(args.database) as db:
             try:
                 last = db.cached_metadata()
-                extra = f"&lastModStartDate={last}&lastModEndDate={now()}"
+                extra = (f"&lastModStartDate={_urlquote(last)}"
+                         f"&lastModEndDate={_urlquote(now())}")
             except TypeError:
                 pass
     else:

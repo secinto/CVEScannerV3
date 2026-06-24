@@ -110,16 +110,27 @@ def parse_version(version):
 
 def parse_cpe(cpe_str):
     """Extract product, version from a CPE string.
-    Handles both cpe:/a:vendor:product:version and cpe:/a:vendor:product formats.
-    Mirrors Lua cpe_parser().
+
+    Handles both CPE binding styles:
+      - 2.2 URI:  cpe:/a:vendor:product:version    -> parts[1] == "/a"
+      - 2.3 string: cpe:2.3:a:vendor:product:version -> parts[1] == "2.3"
+
+    The 2.3 binding carries an extra leading component, so the
+    vendor/product/version columns are shifted by one relative to 2.2.
+    Mirrors Lua cpe_parser() (which only sees 2.2 URIs from nmap).
 
     Returns (product, version_info_dict).
     """
     parts = cpe_str.split(":")
-    # parts: [cpe, /a, vendor, product, version?, ...]
-    product = parts[3] if len(parts) > 3 else None
-    version = parts[4] if len(parts) > 4 else None
-    if product is None:
+    # 2.3 formatted string: cpe:2.3:<part>:vendor:product:version:...
+    if len(parts) > 1 and parts[1] == "2.3":
+        product = parts[4] if len(parts) > 4 else None
+        version = parts[5] if len(parts) > 5 else None
+    else:
+        # 2.2 URI: cpe:/<part>:vendor:product:version
+        product = parts[3] if len(parts) > 3 else None
+        version = parts[4] if len(parts) > 4 else None
+    if not product or product == "*":
         return None, None
     info = parse_version(version)
     return product, info
@@ -1050,6 +1061,20 @@ def cmd_update_db(args):
     if getattr(args, "ecosystems", None):
         ecosystems = [e.strip() for e in args.ecosystems.split(",")]
 
+    # Parse Red Hat options
+    redhat = getattr(args, "redhat", False)
+    redhat_packages = tuple(
+        p.strip()
+        for p in getattr(args, "redhat_packages", "openssh").split(",")
+        if p.strip()
+    )
+    redhat_releases = tuple(
+        r.strip()
+        for r in getattr(args, "redhat_releases", "8,9").split(",")
+        if r.strip()
+    )
+    curated_path = getattr(args, "curated", None)
+
     # Import and delegate to database module
     try:
         from database import run_update
@@ -1067,6 +1092,10 @@ def cmd_update_db(args):
             backports=getattr(args, "backports", False),
             backports_only=backports_only,
             ecosystems=ecosystems,
+            redhat=redhat,
+            redhat_packages=redhat_packages,
+            redhat_releases=redhat_releases,
+            curated_path=curated_path,
         )
     except Exception as e:
         print(f"Error updating database: {e}", file=sys.stderr)
@@ -1267,6 +1296,22 @@ def main():
         "--ecosystems",
         help="Comma-separated OSV ecosystems "
              "(default: Debian:12,Debian:11,Ubuntu:22.04,Ubuntu:24.04)",
+    )
+    update_parser.add_argument(
+        "--redhat", action="store_true",
+        help="Also fetch Red Hat securitydata backports after OSV update",
+    )
+    update_parser.add_argument(
+        "--redhat-packages", default="openssh",
+        help="Comma-separated Red Hat packages to fetch (default: openssh)",
+    )
+    update_parser.add_argument(
+        "--redhat-releases", default="8,9",
+        help="Comma-separated RHEL major releases to fetch (default: 8,9)",
+    )
+    update_parser.add_argument(
+        "--curated",
+        help="Path to curated disposition overlay JSON (highest precedence)",
     )
 
     # -- db-info subcommand --

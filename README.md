@@ -50,12 +50,25 @@ vulnerabilities based on discovered services.
   - `product-aliases.json` — CPE product alias mappings
 
 **For the standalone scanner** (`extra/cvescan.py`), you need:
-- Python 3.8+
+- Python 3.8+ (tested up to 3.14)
 - Dependencies from `extra/requirements.txt`
 
+A virtual environment keeps these dependencies isolated from system Python:
+
 ```bash
-pip install -r extra/requirements.txt
+python3 -m venv extra/venv
+extra/venv/bin/pip install -r extra/requirements.txt
 ```
+
+Then invoke the scanner with that interpreter (run from the project root):
+
+```bash
+extra/venv/bin/python3 extra/cvescan.py --help
+```
+
+> The examples below use plain `python`/`pip` for brevity. If you set up the
+> venv above, substitute `extra/venv/bin/python3` and `extra/venv/bin/pip` so
+> you don't accidentally run a system Python that lacks the dependencies.
 
 ## Optional
 
@@ -317,6 +330,28 @@ management, and statistics without requiring Nmap.
 ```bash
 python extra/cvescan.py --help
 ```
+
+## Scanning a live host with nmap
+
+`scan-host.sh` (repo root) runs `nmap -sV` against a target and reports known
+CVEs for the detected services via `cvescan.py` — no Lua/NSE binding required.
+The pipeline is `nmap -sV -oX` → `extra/nmap_to_services.py` (XML → services
+JSON, preferring nmap's application CPE) → `cvescan.py scan`.
+
+```bash
+# Scan a host (default: nmap top ports, table output, ./cve.db)
+./scan-host.sh collaboration.xitrust.com
+
+# Specific ports, JSON output
+./scan-host.sh -p 443,8080 -f json collaboration.xitrust.com
+
+# Custom database, and pass extra flags straight to nmap after `--`
+./scan-host.sh -c /path/to/cve.db collaboration.xitrust.com -- -Pn --top-ports 200
+```
+
+It uses `extra/venv/bin/python3` automatically when that venv exists, and
+resolves all data files relative to the repo, so it works from any directory.
+Run `./scan-host.sh --help` for all options.
 
 ## Scanning for CVEs
 

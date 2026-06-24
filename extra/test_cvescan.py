@@ -31,6 +31,7 @@ from cvescan import (
     resolve_aliases,
     run_scan,
     scan_service,
+    VERSION,
 )
 from distro import (
     detect_debian_release,
@@ -382,6 +383,26 @@ class TestParseCpe(unittest.TestCase):
         self.assertEqual(info["ver"], "1.26.3")
         self.assertEqual(info["vup"], "*")
 
+    def test_cpe_23_full(self):
+        # 2.3 binding shifts columns by one vs the 2.2 URI form.
+        product, info = parse_cpe(
+            "cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*"
+        )
+        self.assertEqual(product, "http_server")
+        self.assertEqual(info["ver"], "2.4.49")
+
+    def test_cpe_23_wildcard_version(self):
+        product, info = parse_cpe(
+            "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*"
+        )
+        self.assertEqual(product, "http_server")
+        self.assertTrue(info["empty"])
+
+    def test_cpe_wildcard_product_returns_none(self):
+        product, info = parse_cpe("cpe:2.3:a:apache:*:*:*:*:*:*:*:*:*")
+        self.assertIsNone(product)
+        self.assertIsNone(info)
+
 
 # ---------------------------------------------------------------------------
 # Tests: Version matching
@@ -683,7 +704,7 @@ class TestRunScan(unittest.TestCase):
         self.assertIn("metadata", output)
         self.assertIn("results", output)
         self.assertEqual(len(output["results"]), 2)
-        self.assertEqual(output["metadata"]["version"], "3.4")
+        self.assertEqual(output["metadata"]["version"], VERSION)
 
     def test_cache_shared_across_services(self):
         """Same product/version appearing twice should produce identical results
