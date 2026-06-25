@@ -45,7 +45,21 @@ def _service_to_entry(port, host_name):
 
     portid = port.get("portid", "?")
     protocol = port.get("protocol", "tcp")
-    entry = {"id": f"{host_name} {portid}/{protocol}"}
+    entry = {
+        "id": f"{host_name} {portid}/{protocol}",
+        "host": host_name,
+        "port": portid,
+        "protocol": protocol,
+    }
+
+    # Carry nmap's observed banner context through for the report (purely
+    # informational — cvescan matches on cpe/product/version below).
+    for src, dst in (("name", "service_name"), ("product", "banner_product"),
+                     ("version", "banner_version"), ("extrainfo", "extrainfo"),
+                     ("ostype", "ostype")):
+        val = service.get(src)
+        if val:
+            entry[dst] = val
 
     # Prefer the application CPE (cpe:/a:...) — canonical NVD identifier.
     app_cpe = next(

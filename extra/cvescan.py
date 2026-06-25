@@ -26,6 +26,7 @@ import json
 import re
 import sqlite3 as sql
 import sys
+import textwrap
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -428,6 +429,62 @@ def resolve_aliases(product, aliases):
     if aliases and product in aliases:
         names.extend(aliases[product])
     return names
+
+
+def diagnose_no_match(cur, all_products, version_info):
+    """Explain why a product produced zero CVE matches.
+
+    Runs only when the normal lookup returned nothing, so the cost of these
+    extra queries is paid at most once per clean service. Classifies the miss
+    so the report can tell the user *why* nothing matched rather than just
+    showing a bare "0".
+
+    Returns dict: {products_in_db, known_cve_count, reason_code}
+      - unknown_product      : none of the queried names exist in the DB
+      - version_unknown      : product known, but no version was detected
+      - no_vulnerable_version: product known with CVEs, but this version is
+                               outside every affected range
+      - no_known_cves        : product known but carries no CVE records
+    """
+    products_in_db = []
+    for name in all_products:
+        cur.execute(
+            "SELECT 1 FROM products WHERE product = ? LIMIT 1", [name]
+        )
+        if cur.fetchone():
+            products_in_db.append(name)
+
+    known_cve_count = 0
+    if products_in_db:
+        placeholders = ",".join("?" * len(products_in_db))
+        cur.execute(
+            "SELECT COUNT(*) FROM ("  # noqa: S608 - placeholders are bound
+            "  SELECT DISTINCT a.cve_id FROM products p"
+            "    JOIN affected a ON p.product_id = a.product_id"
+            f"   WHERE p.product IN ({placeholders})"
+            "  UNION"
+            "  SELECT DISTINCT m.cve_id FROM products p"
+            "    JOIN multiaffected m ON p.product_id = m.product_id"
+            f"   WHERE p.product IN ({placeholders})"
+            ")",
+            products_in_db + products_in_db,
+        )
+        known_cve_count = cur.fetchone()[0]
+
+    if not products_in_db:
+        reason = "unknown_product"
+    elif version_info["empty"]:
+        reason = "version_unknown"
+    elif known_cve_count > 0:
+        reason = "no_vulnerable_version"
+    else:
+        reason = "no_known_cves"
+
+    return {
+        "products_in_db": products_in_db,
+        "known_cve_count": known_cve_count,
+        "reason_code": reason,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -841,6 +898,24 @@ def scan_service(cur, service, aliases, maxcve, cache=None,
         "total_cves": len(all_vulns),
         "cves": active_cves,
     }
+
+    # Record what was searched (and, when nothing matched, why) so the report
+    # can explain the outcome instead of printing a bare "0".
+    match_info = {
+        "queried_names": all_products,
+        "version_known": not version_info["empty"],
+    }
+    if not all_vulns:
+        match_info.update(diagnose_no_match(cur, all_products, version_info))
+    result["match_info"] = match_info
+
+    # Carry nmap's observed context through for display (added by
+    # nmap_to_services.py; absent for --cpe/--product invocations).
+    for field in ("host", "port", "protocol", "service_name",
+                  "banner_product", "banner_version", "extrainfo", "ostype"):
+        if service.get(field) is not None:
+            result[field] = service[field]
+
     if distro:
         result["distro"] = distro
         if distro_release:
@@ -891,73 +966,325 @@ def run_scan(db_path, services, aliases=None, maxcve=0,
 # Output formatting
 # ---------------------------------------------------------------------------
 
-def _format_cve_row(cve):
-    """Format a single CVE entry as a table row string."""
-    v2 = f"{cve['cvss_v2']:.1f}" if cve["cvss_v2"] is not None else "-"
-    v3 = f"{cve['cvss_v3']:.1f}" if cve["cvss_v3"] is not None else "-"
-    edb = "Yes" if cve.get("exploitdb") else "No"
-    msf = "Yes" if cve.get("metasploit") else "No"
-    return f"  {cve['cve_id']:<20s} {v2:>6s} {v3:>6s} {edb:>9s} {msf:>10s}"
+# ANSI escape codes for optional colourised terminal output.
+_ANSI = {
+    "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
+    "red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m",
+    "blue": "\033[34m", "cyan": "\033[36m", "gray": "\033[90m",
+    "bred": "\033[91m", "bgreen": "\033[92m", "byellow": "\033[93m",
+    "bcyan": "\033[96m",
+}
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+_REPORT_WIDTH = 78
+
+# Severity bands keyed by CVSS base score: (lower_bound, label, ansi_style).
+_SEVERITY_BANDS = (
+    (9.0, "CRITICAL", "bred"),
+    (7.0, "HIGH", "red"),
+    (4.0, "MEDIUM", "yellow"),
+    (0.1, "LOW", "green"),
+    (0.0, "NONE", "gray"),
+)
 
 
-def _format_cve_table_header():
-    """Return the CVE table header and separator."""
-    header = (
-        f"  {'CVE ID':<20s} {'CVSSv2':>6s} {'CVSSv3':>6s}"
-        f" {'ExploitDB':>9s} {'Metasploit':>10s}"
+class _Palette:
+    """Tiny ANSI styler; a no-op when colour is disabled."""
+
+    def __init__(self, enabled):
+        self.enabled = enabled
+
+    def __call__(self, text, *styles):
+        if not self.enabled or not styles:
+            return text
+        codes = "".join(_ANSI.get(s, "") for s in styles)
+        return f"{codes}{text}{_ANSI['reset']}"
+
+
+def _visible_len(text):
+    """Length of a string ignoring ANSI escape codes."""
+    return len(_ANSI_RE.sub("", text))
+
+
+def _justify(left, right, width=_REPORT_WIDTH):
+    """Left/right justify two (possibly coloured) fragments to width."""
+    gap = max(1, width - _visible_len(left) - _visible_len(right))
+    return f"{left}{' ' * gap}{right}"
+
+
+def _cve_score(cve):
+    """Best available CVSS base score for a CVE entry (v3 preferred)."""
+    v3 = _to_float(cve.get("cvss_v3"))
+    return v3 if v3 is not None else _to_float(cve.get("cvss_v2"))
+
+
+def _severity(score):
+    """Map a CVSS base score to a (label, ansi_style) tuple."""
+    if score is None:
+        return "UNKNOWN", "gray"
+    for lower, label, style in _SEVERITY_BANDS:
+        if score >= lower:
+            return label, style
+    return "NONE", "gray"
+
+
+def _exploit_label(cve):
+    """Human description of public-exploit availability for a CVE."""
+    tags = []
+    if cve.get("exploitdb"):
+        tags.append("ExploitDB")
+    if cve.get("metasploit"):
+        tags.append("Metasploit")
+    return ", ".join(tags) if tags else "-"
+
+
+def _service_location(result):
+    """Return (host, 'port/proto') for a result, falling back to its id."""
+    host = result.get("host")
+    port = result.get("port")
+    loc = f"{port}/{result.get('protocol', 'tcp')}" if port else ""
+    rid = result.get("id", "")
+    if not host and rid:
+        parts = rid.rsplit(" ", 1)
+        if len(parts) == 2:
+            host, loc = parts[0], (loc or parts[1])
+        else:
+            host = rid
+    return host or result.get("product", "service"), loc
+
+
+def _no_match_explanation(result):
+    """One-sentence reason a service produced zero CVE matches."""
+    mi = result.get("match_info", {})
+    names = mi.get("queried_names") or [result.get("product", "?")]
+    primary = names[0]
+    reason = mi.get("reason_code")
+    if reason == "unknown_product":
+        return (
+            f'Product "{primary}" is not present in the CVE database. nmap\'s '
+            "service label has no matching NVD product entry, so there is no "
+            "CVE data to compare the detected version against."
+        )
+    if reason == "version_unknown":
+        return (
+            f'Product "{primary}" is known to the database, but no version '
+            "could be determined from the service banner. Only "
+            "version-independent CVEs could match, and none applied."
+        )
+    if reason == "no_vulnerable_version":
+        count = mi.get("known_cve_count", 0)
+        return (
+            f'Product "{primary}" has {count} known CVE(s) in the database, '
+            "but the detected version falls outside every affected range — it "
+            "appears patched or newer than all known-vulnerable versions."
+        )
+    if reason == "no_known_cves":
+        return (
+            f'Product "{primary}" exists in the database but currently has no '
+            "associated CVE records."
+        )
+    return "No CVEs matched the detected service."
+
+
+def _wrap_detail(label, text, pal, width=_REPORT_WIDTH):
+    """Render a 'Label: text' detail, wrapping/indenting long values."""
+    prefix = f"  {label}: "
+    indent = " " * _visible_len(prefix)
+    wrapped = textwrap.wrap(text, width=width - len(indent)) or [""]
+    out = [f"{prefix}{pal(wrapped[0], 'dim')}"]
+    out += [f"{indent}{pal(line, 'dim')}" for line in wrapped[1:]]
+    return out
+
+
+def _cve_table_header(pal):
+    """Return the coloured CVE table header line and separator."""
+    head = (
+        f"  {'SEVERITY':<8s}  {'CVE ID':<16s} "
+        f"{'CVSSv3':>6s} {'CVSSv2':>6s}  EXPLOITS"
     )
-    sep = "  " + "-" * 55
-    return header, sep
+    return pal(head, "dim"), pal("  " + "-" * (_REPORT_WIDTH - 2), "gray")
 
 
-def format_table(output):
-    """Format scan output as a human-readable table."""
-    lines = []
+def _format_cve_row(cve, pal):
+    """Format a single CVE entry as an aligned, optionally-coloured row."""
+    v2f, v3f = _to_float(cve.get("cvss_v2")), _to_float(cve.get("cvss_v3"))
+    v2 = f"{v2f:.1f}" if v2f is not None else "-"
+    v3 = f"{v3f:.1f}" if v3f is not None else "-"
+    label, style = _severity(_cve_score(cve))
+    exploits = _exploit_label(cve)
+    sev = pal(f"{label:<8s}", style, "bold")
+    cid = pal(f"{cve['cve_id']:<16s}", "bold")
+    expl = pal(exploits, "bred", "bold") if exploits != "-" else pal("-", "gray")
+    return f"  {sev}  {cid} {v3:>6s} {v2:>6s}  {expl}"
+
+
+def _severity_breakdown(cves, pal):
+    """One-line severity tally for a service's active CVEs, or '' if empty."""
+    counts = {}
+    exploitable = 0
+    for cve in cves:
+        label, _ = _severity(_cve_score(cve))
+        counts[label] = counts.get(label, 0) + 1
+        if cve.get("exploitdb") or cve.get("metasploit"):
+            exploitable += 1
+    parts = []
+    for _, label, style in _SEVERITY_BANDS:
+        if counts.get(label):
+            parts.append(pal(f"{counts[label]} {label.title()}", style, "bold"))
+    if counts.get("UNKNOWN"):
+        parts.append(pal(f"{counts['UNKNOWN']} Unknown", "gray"))
+    line = "  Severity: " + "  ".join(parts)
+    if exploitable:
+        line += pal(f"   ({exploitable} with public exploit)", "bred")
+    return line
+
+
+def _status_badge(cves, pal):
+    """Right-aligned status badge for a service heading."""
+    if not cves:
+        return pal("[ CLEAN ]", "bgreen", "bold")
+    crit = sum(1 for c in cves if _severity(_cve_score(c))[0] == "CRITICAL")
+    high = sum(1 for c in cves if _severity(_cve_score(c))[0] == "HIGH")
+    text = f"{len(cves)} CVE" + ("s" if len(cves) != 1 else "")
+    if crit:
+        return pal(f"[ {text} · {crit} CRITICAL ]", "bred", "bold")
+    if high:
+        return pal(f"[ {text} · {high} HIGH ]", "red", "bold")
+    return pal(f"[ {text} ]", "byellow", "bold")
+
+
+def format_table(output, color=False):
+    """Format scan output as a human-readable report.
+
+    color: emit ANSI colour codes (callers gate this on an interactive TTY).
+    """
+    pal = _Palette(color)
     meta = output["metadata"]
-    lines.append(f"Database: {meta['database']}")
-    lines.append(f"Timestamp: {meta['timestamp']}")
+    results = output["results"]
+    lines = []
+
+    # ---- report header --------------------------------------------------
+    bar = "=" * _REPORT_WIDTH
+    lines.append(pal(bar, "bcyan"))
+    lines.append(pal(" CVEScannerV3 — Vulnerability Report", "bold", "bcyan"))
+    lines.append(pal(bar, "bcyan"))
+
+    affected = sum(1 for r in results if r.get("cves"))
+    total_cves = sum(len(r.get("cves", [])) for r in results)
+    clean = len(results) - affected
+    lines.append(f"  Database  : {meta['database']}")
+    lines.append(f"  Scanned   : {_format_timestamp(meta.get('timestamp'))}")
+    if meta.get("version"):
+        lines.append(f"  Engine    : CVEScannerV3 v{meta['version']}")
+    lines.append(
+        f"  Services  : {len(results)} scanned · "
+        f"{pal(str(affected) + ' with CVEs', 'byellow' if affected else 'dim')} · "
+        f"{pal(str(clean) + ' clean', 'bgreen' if clean else 'dim')}"
+    )
     lines.append("")
 
-    for result in output["results"]:
-        header = result["product"]
-        if result.get("id"):
-            header = f"[{result['id']}] {header}"
-        header += f" {result['version']}"
-        if result["version_update"] != "*":
-            header += result["version_update"]
-        lines.append(header)
+    # ---- per-service blocks ---------------------------------------------
+    for result in results:
+        host, loc = _service_location(result)
+        cves = result.get("cves", [])
 
+        lines.append(pal("-" * _REPORT_WIDTH, "gray"))
+        heading = f"{pal('●', 'bcyan')} {pal(host, 'bold')}"
+        if loc:
+            heading += f"  {pal(loc, 'cyan')}"
+        lines.append(_justify(heading, _status_badge(cves, pal)))
+        lines.append(pal("-" * _REPORT_WIDTH, "gray"))
+
+        # What nmap observed.
+        svc_bits = []
+        if result.get("service_name"):
+            svc_bits.append(result["service_name"])
+        banner = " ".join(
+            x for x in (result.get("banner_product"),
+                        result.get("banner_version")) if x
+        )
+        if banner:
+            svc_bits.append(f"({banner})")
+        if result.get("extrainfo"):
+            svc_bits.append(f"[{result['extrainfo']}]")
+        if svc_bits:
+            lines.append(f"  Service : {' '.join(svc_bits)}")
+
+        # Product / version as matched against the database.
+        ver = result.get("version", "*")
+        vup = result.get("version_update", "*")
+        if ver in (None, "*"):
+            ver_disp = pal("unknown", "dim")
+        else:
+            ver_disp = ver + (vup if vup and vup != "*" else "")
+        lines.append(f"  Product : {result['product']}   Version: {ver_disp}")
+
+        if result.get("cpe"):
+            lines.append(f"  CPE     : {result['cpe']}")
         if result.get("distro"):
             distro_str = result["distro"]
             if result.get("distro_release"):
                 distro_str += f" ({result['distro_release']})"
             lines.append(f"  Distro: {distro_str}")
 
-        lines.append(f"  Total CVEs: {result['total_cves']}")
+        queried = (result.get("match_info") or {}).get("queried_names") or []
+        extra_aliases = [n for n in queried if n != result["product"]]
+        if extra_aliases:
+            lines.append(f"  Aliases : also searched {', '.join(extra_aliases)}")
 
-        if result["cves"]:
-            hdr, sep = _format_cve_table_header()
-            lines.append(hdr)
-            lines.append(sep)
-            for cve in result["cves"]:
-                lines.append(_format_cve_row(cve))
-
-        if result.get("likely_patched"):
+        # Findings or an explanation of the miss.
+        lines.append("")
+        if cves:
+            lines.append(_severity_breakdown(cves, pal))
             lines.append("")
-            lines.append("  Likely Patched:")
-            hdr, sep = _format_cve_table_header()
+            hdr, sep = _cve_table_header(pal)
             lines.append(hdr)
             lines.append(sep)
-            for cve in result["likely_patched"]:
-                row = _format_cve_row(cve)
+            for cve in cves:
+                lines.append(_format_cve_row(cve, pal))
+        else:
+            lines.append(f"  {pal('No CVEs matched.', 'bgreen', 'bold')}")
+            lines += _wrap_detail("Why", _no_match_explanation(result), pal)
+
+        # Suppressed / likely-patched findings.
+        if result.get("likely_patched"):
+            patched = result["likely_patched"]
+            lines.append("")
+            lines.append(
+                "  " + pal(f"Likely Patched: {len(patched)} suppressed", "dim")
+                + pal(" (distro backport / version evidence)", "gray")
+            )
+            hdr, sep = _cve_table_header(pal)
+            lines.append(hdr)
+            lines.append(sep)
+            for cve in patched:
+                row = _format_cve_row(cve, pal)
                 fv = cve.get("fixed_version", "")
                 if fv:
-                    row += f"  (fixed: {fv})"
+                    row += pal(f"  (fixed: {fv})", "gray")
                 lines.append(row)
 
         lines.append("")
 
+    # ---- summary footer -------------------------------------------------
+    if total_cves:
+        all_active = [c for r in results for c in r.get("cves", [])]
+        lines.append(pal("=" * _REPORT_WIDTH, "bcyan"))
+        lines.append(_severity_breakdown(all_active, pal).replace(
+            "  Severity: ", f"  Total: {total_cves} active CVE(s) — ", 1))
+        lines.append(pal("=" * _REPORT_WIDTH, "bcyan"))
+
     return "\n".join(lines)
+
+
+def _format_timestamp(iso_ts):
+    """Render an ISO timestamp as 'YYYY-MM-DD HH:MM:SS UTC' (best effort)."""
+    if not iso_ts:
+        return "unknown"
+    try:
+        dt = datetime.fromisoformat(iso_ts).astimezone(timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    except (ValueError, TypeError):
+        return iso_ts
 
 
 # ---------------------------------------------------------------------------
@@ -1173,9 +1500,18 @@ def cmd_scan(args):
         cpe_to_pkg=cpe_to_pkg, online=online,
     )
 
-    # Format output
-    if args.format == "table":
-        text = format_table(output)
+    # Resolve "auto": a human at the terminal gets the readable table; pipes
+    # and files get JSON so existing automation keeps parsing it.
+    interactive = (not args.output) and sys.stdout.isatty()
+    fmt = args.format
+    if fmt == "auto":
+        fmt = "table" if interactive else "json"
+
+    # Format output. Colour only on an interactive terminal, honouring NO_COLOR.
+    if fmt == "table":
+        import os
+        use_color = interactive and os.environ.get("NO_COLOR") is None
+        text = format_table(output, color=use_color)
     else:
         text = json.dumps(output, indent=2)
 
@@ -1246,8 +1582,9 @@ def main():
         help="Output file path (default: stdout)",
     )
     scan_parser.add_argument(
-        "--format", choices=["json", "table"], default="json",
-        help="Output format (default: json)",
+        "--format", choices=["json", "table", "auto"], default="auto",
+        help="Output format: json | table | auto (default: auto — table on "
+             "an interactive terminal, json when piped or written to a file)",
     )
     distro_group = scan_parser.add_argument_group("distro detection")
     distro_group.add_argument(
