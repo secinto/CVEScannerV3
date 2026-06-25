@@ -25,7 +25,7 @@ fi
 # --- defaults ---------------------------------------------------------------
 CVE_DB="${CVE_DB:-$SCRIPT_DIR/cve.db}"
 PORTS=""
-FORMAT="table"
+FORMAT="auto"
 MAXCVE=""
 OUTPUT=""
 KEEP_XML=0
@@ -41,7 +41,8 @@ services using the standalone cvescan.py engine.
 Options:
   -c, --cve PATH     CVE database path (default: <repo>/cve.db, or $CVE_DB)
   -p, --ports SPEC   nmap port spec, e.g. 80,443 or 1-1024 (default: nmap top ports)
-  -f, --format FMT   output format: table | json (default: table)
+  -f, --format FMT   output format: table | json | auto (default: auto —
+                     table on a terminal, json when redirected to a file)
   -m, --maxcve N     max CVEs reported per service (0 = unlimited)
   -o, --output FILE  write CVE results to FILE instead of stdout
       --keep-xml     keep the intermediate nmap XML (path printed on stderr)
@@ -99,9 +100,11 @@ NMAP_CMD=(nmap -sV -oX "$XML_FILE")
 [[ ${#NMAP_EXTRA[@]} -gt 0 ]] && NMAP_CMD+=("${NMAP_EXTRA[@]}")
 NMAP_CMD+=("$TARGET")
 
-echo "[*] Running: ${NMAP_CMD[*]}" >&2
+echo "[1/2] nmap service detection → $TARGET" >&2
+echo "      $ ${NMAP_CMD[*]}" >&2
 "${NMAP_CMD[@]}" >&2
 [[ "$KEEP_XML" -eq 1 ]] && echo "[*] nmap XML kept at: $XML_FILE" >&2
+echo "[2/2] matching detected services against CVE database…" >&2
 
 # --- convert nmap XML → services JSON → cvescan.py scan ---------------------
 SCAN_CMD=("$PY" "$EXTRA_DIR/cvescan.py" scan

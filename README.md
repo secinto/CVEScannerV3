@@ -389,13 +389,16 @@ cat services.json | python extra/cvescan.py scan -i -
 Output options:
 
 ```bash
-# JSON output (default)
+# Auto (default): readable colour table on a terminal, JSON when piped/redirected
 python extra/cvescan.py scan -p openssh -v 4.7
 
-# Table output
+# Force JSON (machine-readable) regardless of where it goes
+python extra/cvescan.py scan -p openssh -v 4.7 --format json
+
+# Force the readable table
 python extra/cvescan.py scan -p openssh -v 4.7 --format table
 
-# Write to file
+# Write to file (auto → JSON)
 python extra/cvescan.py scan -p openssh -v 4.7 -o results.json
 
 # Limit CVEs per service

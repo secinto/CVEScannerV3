@@ -20,6 +20,7 @@ from cvescan import (
     annotate_confidence,
     check_backports,
     compare_version,
+    diagnose_no_match,
     find_vulnerabilities,
     format_table,
     get_exploit_info,
@@ -754,6 +755,87 @@ class TestFormatTable(unittest.TestCase):
         self.assertIn("openssh", text)
         self.assertIn("CVE-2016-1908", text)
         self.assertIn("9.8", text)
+        # Severity is derived from the CVSS score for the report.
+        self.assertIn("CRITICAL", text)
+
+    def test_table_severity_bands(self):
+        """Each CVSS band renders its severity label."""
+        output = {
+            "metadata": {"timestamp": "2026-01-01T00:00:00+00:00",
+                         "database": "t.db", "version": "3.4"},
+            "results": [{
+                "product": "openssh", "version": "4.7", "version_update": "*",
+                "total_cves": 4,
+                "cves": [
+                    {"cve_id": "CVE-A", "cvss_v2": None, "cvss_v3": 9.9},
+                    {"cve_id": "CVE-B", "cvss_v2": None, "cvss_v3": 7.5},
+                    {"cve_id": "CVE-C", "cvss_v2": None, "cvss_v3": 5.0},
+                    {"cve_id": "CVE-D", "cvss_v2": None, "cvss_v3": 2.0},
+                ],
+            }],
+        }
+        text = format_table(output)
+        for label in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+            self.assertIn(label, text)
+
+    def test_table_clean_explains_why(self):
+        """A zero-match service shows a CLEAN badge and a 'Why' explanation."""
+        output = {
+            "metadata": {"timestamp": "2026-01-01T00:00:00+00:00",
+                         "database": "t.db", "version": "3.4"},
+            "results": [{
+                "product": "vercel", "version": "*", "version_update": "*",
+                "total_cves": 0, "cves": [],
+                "host": "example.com", "port": "80", "protocol": "tcp",
+                "service_name": "http", "banner_product": "Vercel",
+                "match_info": {"queried_names": ["vercel"],
+                               "products_in_db": [], "known_cve_count": 0,
+                               "reason_code": "unknown_product"},
+            }],
+        }
+        text = format_table(output)
+        self.assertIn("CLEAN", text)
+        self.assertIn("No CVEs matched.", text)
+        self.assertIn("Why:", text)
+        self.assertIn("not present in the CVE database", text)
+
+    def test_table_no_color_has_no_ansi(self):
+        """Default (color=False) output contains no escape codes."""
+        output = {
+            "metadata": {"timestamp": "2026-01-01T00:00:00+00:00",
+                         "database": "t.db", "version": "3.4"},
+            "results": [{"product": "openssh", "version": "4.7",
+                         "version_update": "*", "total_cves": 0, "cves": [],
+                         "match_info": {"queried_names": ["openssh"],
+                                        "reason_code": "no_known_cves"}}],
+        }
+        self.assertNotIn("\033", format_table(output))
+
+
+class TestDiagnoseNoMatch(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.conn = create_test_db()
+
+    def _diagnose(self, names, version):
+        cur = self.conn.cursor()
+        return diagnose_no_match(cur, names, parse_version(version))
+
+    def test_unknown_product(self):
+        info = self._diagnose(["totally-unknown"], None)
+        self.assertEqual(info["reason_code"], "unknown_product")
+        self.assertEqual(info["products_in_db"], [])
+
+    def test_version_unknown(self):
+        info = self._diagnose(["openssh"], None)
+        self.assertEqual(info["reason_code"], "version_unknown")
+        self.assertIn("openssh", info["products_in_db"])
+        self.assertGreater(info["known_cve_count"], 0)
+
+    def test_no_vulnerable_version(self):
+        info = self._diagnose(["nginx"], "99.99")
+        self.assertEqual(info["reason_code"], "no_vulnerable_version")
+        self.assertGreater(info["known_cve_count"], 0)
 
 
 # ---------------------------------------------------------------------------
