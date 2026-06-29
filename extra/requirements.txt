@@ -9,12 +9,11 @@ h11>=0.16.0
 httpcore>=1.0.9
 httpx>=0.28.1
 idna>=3.6
-# database.py uses the v2 API (RequestRate, Limiter.ratelimit). That API was
-# removed in pyrate-limiter 3.0, so the unbounded `>=2.10.0` let pip resolve
-# forward to a 3.x/4.x wheel -> ImportError on `RequestRate`. Cap below the
-# breaking major (2.x is pure Python, installs on 3.8-3.14) until the code is
-# migrated to the v3+ API.
-pyrate-limiter>=2.10.0,<3
+# database.py uses the pyrate-limiter v4 API (Rate/Duration + the keyword-arg
+# `Limiter.as_decorator(name=...)`). The v2 (RequestRate) and v3
+# (mapping-function as_decorator) APIs are both incompatible, so require the 4.x
+# line. 4.x is pure Python and installs on 3.8-3.14.
+pyrate-limiter>=4.0.1,<5
 sniffio>=1.3.1
 texttable>=1.7.0
 tqdm>=4.66.2

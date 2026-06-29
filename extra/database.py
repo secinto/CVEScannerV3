@@ -40,15 +40,18 @@ from urllib.parse import quote as _urlquote
 import httpx
 from fake_useragent import UserAgent
 
-from pyrate_limiter import Limiter, RequestRate
+from pyrate_limiter import Duration, Limiter, Rate
 from tqdm import tqdm
 
 
-# NVD allows 50 requests per rolling 30s window with an API key. A fixed-window
+# NVD allows 50 requests per rolling 30s window with an API key. Setting the
 # rate this close to the ceiling can momentarily burst over it (and thus draw
 # 429s), so default a little below and let it be tuned via the environment.
 NVD_RATE_PER_30S = int(os.getenv("NVD_RATE_PER_30S", "40"))
-LIMITER = Limiter(RequestRate(NVD_RATE_PER_30S, 30))
+# pyrate-limiter Duration is millisecond-based, so a 30s window is
+# Duration.SECOND * 30. The sync decorator blocks until a slot frees (the v4
+# equivalent of the old v2 `delay=True`).
+LIMITER = Limiter(Rate(NVD_RATE_PER_30S, Duration.SECOND * 30))
 # NVD's edge (Cloudflare) intermittently answers with HTTP 429 or an HTML 503
 # "No server is available" page instead of JSON. Retry transient failures with
 # exponential backoff so a blip doesn't silently drop a whole batch of records.
@@ -912,7 +915,7 @@ def nvd_get_json(url, headers=None, timeout=120, max_retries=NVD_MAX_RETRIES):
     )
 
 
-@LIMITER.ratelimit("identity", delay=True)
+@LIMITER.as_decorator(name="identity")
 def query_api(args):
     try:
         url, bar, thread_objs, batch, populate = args
