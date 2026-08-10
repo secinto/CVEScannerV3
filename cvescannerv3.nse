@@ -527,6 +527,14 @@ local function version_parser (product, version)
    if version then
       -- remove Nmap comment of version
       version = version:gsub('for_windows_', '')
+      -- MariaDB 10.0+ prefixes its wire-protocol version with a constant
+      -- "5.5.5-" for pre-5.5.5 MySQL client compatibility. It is a marker,
+      -- not a version: "5.5.5-10.11.14" IS 10.11.14. Left in place, the host
+      -- is scored against the whole MySQL 5.5 CVE history. Only stripped when
+      -- a real version follows (mirrors Python _RE_MARIADB_COMPAT_PREFIX).
+      if version:match('^5%.5%.5%-%d+%.%d+') then
+         version = version:gsub('^5%.5%.5%-', '', 1)
+      end
    end
 
    -- if Nmap could not detect version, assume all versions and vupdates possible

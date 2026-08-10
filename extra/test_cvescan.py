@@ -365,6 +365,23 @@ class TestParseVersion(unittest.TestCase):
         self.assertEqual(info["ver"], "4.7")
         self.assertEqual(info["vup"], "*")
 
+    def test_mariadb_compat_prefix_stripped(self):
+        # Real nmap output for a MariaDB 10.11 host. Without the strip the
+        # leading numeric run wins and the host is matched as MySQL 5.5.5,
+        # pulling in the whole 5.5 CVE history.
+        info = parse_version("5.5.5-10.11.14")
+        self.assertEqual(info["ver"], "10.11.14")
+
+    def test_mariadb_compat_prefix_with_trailing_build(self):
+        info = parse_version("5.5.5-10.6.27-MariaDB-0+deb12u1")
+        self.assertEqual(info["ver"], "10.6.27")
+
+    def test_mariadb_prefix_not_stripped_without_version(self):
+        # A genuine 5.5.5 with a non-version suffix must survive intact.
+        self.assertEqual(parse_version("5.5.5-log")["ver"], "5.5.5")
+        self.assertEqual(parse_version("5.5.5-1ubuntu0.1")["ver"], "5.5.5")
+        self.assertEqual(parse_version("5.5.5")["ver"], "5.5.5")
+
 
 class TestParseCpe(unittest.TestCase):
     def test_full_cpe(self):
@@ -1003,9 +1020,41 @@ class TestDistroDetection(unittest.TestCase):
         self.assertIsNotNone(info)
         self.assertEqual(info["distro"], "ubuntu")
 
+    def test_ubuntu_ssh_banner_nmap_space_form(self):
+        # nmap rewrites the banner's "Ubuntu-3ubuntu13.16" as a space-separated
+        # version attribute, and pipelines synthesize banners from that. Only
+        # the hyphen form used to match, so no nmap-derived Debian/Ubuntu host
+        # ever reached backport suppression.
+        banner = "OpenSSH_9.6p1 Ubuntu 3ubuntu13.16 Ubuntu Linux; protocol 2.0"
+        info = detect_distro_from_banner(banner)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["distro"], "ubuntu")
+        self.assertEqual(info["distro_release"], "noble")
+        self.assertEqual(info["package_revision"], "3ubuntu13.16")
+
+    def test_debian_ssh_banner_nmap_space_form(self):
+        banner = "OpenSSH_9.2p1 Debian 2+deb12u10 Debian Linux; protocol 2.0"
+        info = detect_distro_from_banner(banner)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["distro"], "debian")
+        self.assertEqual(info["distro_release"], "bookworm")
+        self.assertEqual(info["package_revision"], "2+deb12u10")
+
+    def test_os_family_word_is_not_a_revision(self):
+        # Synthesized banners append nmap's extrainfo ("Ubuntu Linux; ..."),
+        # which must never be mistaken for a package revision.
+        info = detect_distro_from_banner("OpenSSH_9.2p1 Ubuntu Linux; protocol 2.0")
+        self.assertIsNone(info)
+
     def test_bare_banner(self):
         info = detect_distro_from_banner("OpenSSH_9.2p1")
         self.assertIsNone(info)
+
+    def test_bare_banner_not_resolved_by_stock_version(self):
+        # 9.2p1 is Bookworm's stock OpenSSH, but a stripped banner (DebianBanner
+        # no) carries no package revision — inferring a release here would
+        # assert a patch level the host never disclosed.
+        self.assertIsNone(detect_distro_from_banner("OpenSSH_9.2p1 protocol 2.0"))
 
     def test_empty_banner(self):
         self.assertIsNone(detect_distro_from_banner(""))

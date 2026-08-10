@@ -72,6 +72,9 @@ def compare_version(v1, v2):
     return 0
 
 
+_RE_MARIADB_COMPAT_PREFIX = re.compile(r"^5\.5\.5-(?=\d+\.\d+)")
+
+
 def parse_version(version):
     """Parse a version string into a structured dict.
     Mirrors Lua version_parser().
@@ -84,6 +87,15 @@ def parse_version(version):
 
     # Strip nmap platform markers (mirrors Lua: version:gsub('for_windows_', ''))
     version = version.replace("for_windows_", "")
+
+    # MariaDB 10.0+ prefixes its wire-protocol version with a constant
+    # "5.5.5-" so pre-5.5.5 MySQL clients don't reject a major >= 10 in the
+    # handshake. It is a compatibility marker, not a version: "5.5.5-10.11.14"
+    # IS 10.11.14. Left in place, the leading numeric run wins below and the
+    # host is scored against the entire MySQL 5.5 CVE history.
+    # Only stripped when a real version follows, so "5.5.5-log" and a genuine
+    # 5.5.5 packaging revision ("5.5.5-1ubuntu0.1") are left untouched.
+    version = _RE_MARIADB_COMPAT_PREFIX.sub("", version, count=1)
 
     # Range patterns: "3.x - 4.x" or "3.3.x - 3.4.x"
     m = re.match(r"([^-]*)\s+-\s+([^-]*)", version)

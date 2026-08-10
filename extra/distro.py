@@ -26,6 +26,31 @@ UBUNTU_RELEASES = {
     "kinetic": ("kinetic", "22.10"),
 }
 
+# Stock OpenSSH upstream version per Debian/Ubuntu release. Unlike Debian's
+# "+deb12u7", an Ubuntu package revision ("3ubuntu13.16") does not embed the
+# codename, so the revision alone cannot resolve a release. Each release does
+# pin exactly one upstream OpenSSH version for its lifetime, so the version
+# resolves it instead. Only unambiguous versions are mapped: 9.0p1 shipped in
+# both kinetic and lunar and so is deliberately absent.
+#
+# These maps are consulted ONLY when a distro tag is present in the banner.
+# A bare banner (DebianBanner no) must stay unresolved — matching a stock
+# version there would assert a patch level the banner does not carry.
+UBUNTU_OPENSSH_RELEASES = {
+    "7.6p1": "bionic",
+    "8.2p1": "focal",
+    "8.9p1": "jammy",
+    "9.3p1": "mantic",
+    "9.6p1": "noble",
+}
+DEBIAN_OPENSSH_RELEASES = {
+    "7.4p1": "stretch",
+    "7.9p1": "buster",
+    "8.4p1": "bullseye",
+    "9.2p1": "bookworm",
+    "10.0p2": "trixie",
+}
+
 # RHEL family freezes exactly one OpenSSH version per major release and never
 # bumps the version string — fixes are backported as RPM release bumps
 # (openssh-8.0p1-19.el8 → -29.el8_10). So the bare upstream version in the SSH
@@ -88,11 +113,21 @@ RELEASE_TO_OSV = {
 }
 
 # SSH banner patterns
+#
+# The separator is [-\s], not just "-": sshd sends "OpenSSH_9.6p1
+# Ubuntu-3ubuntu13.16", but nmap normalizes that hyphen to a space in its
+# `version` attribute ("9.6p1 Ubuntu 3ubuntu13.16"), and banners are
+# synthesized from that attribute. Matching only the hyphen silently missed
+# every nmap-derived banner, so Debian/Ubuntu backport suppression never ran.
+#
+# The revision must start with a digit. Synthesized banners append nmap's
+# `extrainfo`, which reads "Ubuntu Linux; protocol 2.0" — without that anchor
+# a tagless banner would capture "Linux;" as its package revision.
 _RE_DEBIAN_SSH = re.compile(
-    r"OpenSSH_[\d.]+p\d+\s+Debian-(\S+)", re.IGNORECASE
+    r"OpenSSH_([\d.]+p\d+)\s+Debian[-\s](\d\S*)", re.IGNORECASE
 )
 _RE_UBUNTU_SSH = re.compile(
-    r"OpenSSH_[\d.]+p\d+\s+Ubuntu-(\S+)", re.IGNORECASE
+    r"OpenSSH_([\d.]+p\d+)\s+Ubuntu[-\s](\d\S*)", re.IGNORECASE
 )
 # RHEL-family SSH banner: bare "OpenSSH_<maj>.<min>" with NO portable "pN"
 # suffix and NO distro tag. The absence of "pN" is itself the RHEL tell —
@@ -117,28 +152,36 @@ _RE_UBUNTU_HTTP = re.compile(r"\(Ubuntu\)", re.IGNORECASE)
 _RE_APACHE_VER = re.compile(r"Apache(?:\s+httpd)?/(\d+\.\d+\.\d+)", re.IGNORECASE)
 
 
-def detect_debian_release(revision):
+def detect_debian_release(revision, version=None):
     """Map Debian package revision to codename.
 
     E.g. '2+deb12u7' → 'bookworm'
+
+    `version` is the upstream OpenSSH version from the same tagged banner. It
+    is a fallback for revisions nmap truncated to a bare number ("Debian 7"),
+    where the "+debN" marker is gone.
     """
     for tag, (codename, _) in DEBIAN_RELEASES.items():
         if tag in revision:
             return codename
-    return None
+    return DEBIAN_OPENSSH_RELEASES.get(version or "")
 
 
-def detect_ubuntu_release(revision):
+def detect_ubuntu_release(revision, version=None):
     """Map Ubuntu package revision to codename.
 
     E.g. '3ubuntu0.10' → try matching known codename hints.
     Ubuntu revisions don't always embed the codename, so this is best-effort.
+
+    `version` is the upstream OpenSSH version from the same tagged banner.
+    Ubuntu revisions normally carry no codename at all ('3ubuntu13.16'), so
+    the stock-version map is the primary resolver here, not a rare fallback.
     """
     rev_lower = revision.lower()
     for codename in UBUNTU_RELEASES:
         if codename in rev_lower:
             return codename
-    return None
+    return UBUNTU_OPENSSH_RELEASES.get(version or "")
 
 
 def detect_rhel_release(openssh_version):
@@ -171,10 +214,11 @@ def detect_distro_from_banner(banner):
         return None
 
     # Debian SSH banner: OpenSSH_9.2p1 Debian-2+deb12u7
+    # (nmap-normalized: OpenSSH_9.2p1 Debian 2+deb12u10)
     m = _RE_DEBIAN_SSH.search(banner)
     if m:
-        revision = m.group(1)
-        codename = detect_debian_release(revision)
+        version, revision = m.group(1), m.group(2)
+        codename = detect_debian_release(revision, version)
         return {
             "distro": "debian",
             "distro_release": codename,
@@ -182,10 +226,11 @@ def detect_distro_from_banner(banner):
         }
 
     # Ubuntu SSH banner: OpenSSH_8.9p1 Ubuntu-3ubuntu0.10
+    # (nmap-normalized: OpenSSH_9.6p1 Ubuntu 3ubuntu13.16)
     m = _RE_UBUNTU_SSH.search(banner)
     if m:
-        revision = m.group(1)
-        codename = detect_ubuntu_release(revision)
+        version, revision = m.group(1), m.group(2)
+        codename = detect_ubuntu_release(revision, version)
         return {
             "distro": "ubuntu",
             "distro_release": codename,
@@ -200,7 +245,7 @@ def detect_distro_from_banner(banner):
     m = _RE_BARE_SSH.search(banner)
     if m and not m.group(2):  # group(2) is the "pN" suffix — must be absent
         tail = m.group(3) or ""
-        if not re.search(r"Debian-|Ubuntu-", tail, re.IGNORECASE):
+        if not re.search(r"Debian[-\s]|Ubuntu[-\s]", tail, re.IGNORECASE):
             el_major = detect_rhel_release(m.group(1))
             if el_major:
                 return {
