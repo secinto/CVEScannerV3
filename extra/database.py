@@ -735,8 +735,17 @@ def update_backports_ubuntu(db_path, releases=("24.04", "22.04", "20.04"),
             db.cursor.executemany(cols.format("IGNORE"), soft)
             db.conn.commit()
             total += len(definitive) + len(soft)
-            print(f"[+] Ubuntu {package}: {len(definitive)} definitive + "
-                  f"{len(soft)} other rows ({len(entries)} CVEs scanned)")
+            if not definitive and not soft:
+                # A misspelled or wrongly-versioned source package name returns
+                # an empty result set, not an error — Ubuntu's source names are
+                # not the CPE product names (exim -> exim4, mysql -> mysql-8.0).
+                # Left quiet, that reads as "nothing to suppress", which is
+                # indistinguishable from "this package is clean".
+                print(f"[!] Ubuntu {package}: no rows — check the source "
+                      f"package name ({len(entries)} CVEs returned)")
+            else:
+                print(f"[+] Ubuntu {package}: {len(definitive)} definitive + "
+                      f"{len(soft)} other rows ({len(entries)} CVEs scanned)")
 
         for rel in releases:
             db.cursor.execute(

@@ -375,6 +375,28 @@ class TestParseVersion(unittest.TestCase):
         self.assertEqual(info["ver"], "4.7")
         self.assertEqual(info["vup"], "*")
 
+    def test_open_bound_is_not_a_version(self):
+        # nmap says "2.0.0 or later" when it can place HAProxy but not its
+        # build. Read literally that pins the host to the oldest build in the
+        # range and scores it for every CVE fixed since — every one of the
+        # corpus's 298 HAProxy detections is such a bound.
+        for v in ("2.0.0 or later", "9.6.0 or later", "10.3.23 or earlier",
+                  "1.2 or newer"):
+            info = parse_version(v)
+            self.assertTrue(info["empty"], v)
+            self.assertEqual(info["ver"], "*", v)
+
+    def test_numeric_range_still_parses_as_a_range(self):
+        # A closed range is usable and must not be swept up with open bounds.
+        info = parse_version("1.3.1 - 1.9.0")
+        self.assertTrue(info["range_"])
+        self.assertEqual(info["from_"], "1.3.1")
+        self.assertEqual(info["to_"], "1.9.0")
+
+    def test_ordinary_versions_are_untouched(self):
+        self.assertEqual(parse_version("2.4.22")["ver"], "2.4.22")
+        self.assertEqual(parse_version("9.6p1")["ver"], "9.6")
+
     def test_mariadb_compat_prefix_stripped(self):
         # Real nmap output for a MariaDB 10.11 host. Without the strip the
         # leading numeric run wins and the host is matched as MySQL 5.5.5,
