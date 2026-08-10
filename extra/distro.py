@@ -393,6 +393,65 @@ def release_support_status(distro, release, today=None):
     }
 
 
+# Patch-confidence states. External scanning can read a version string but not
+# a patch level, and those are different things: a distro backports security
+# fixes without moving the upstream version, so "OpenSSH 9.2p1" alone says
+# nothing about whether a given CVE is fixed. These three states record how
+# much the observed banner actually supports.
+#
+#   CONFIRMED  a package revision was observed (Debian/Ubuntu tag) or the
+#              el-family frozen-version path resolved a release. Backport
+#              evaluation applies and its verdict can be trusted.
+#   UNKNOWN    the host is evidently distro-managed but disclosed no patch
+#              level -- a stripped banner (DebianBanner no), or an OS tag with
+#              no revision. Version-range matching still produces CVEs, but
+#              they are POTENTIAL: undecidable from outside.
+#   UPSTREAM   the version is not attributable to any distro's stock package,
+#              so upstream range matching means what it says.
+PATCH_CONFIRMED = "confirmed"
+PATCH_LEVEL_UNKNOWN = "patch-level-unknown"
+PATCH_UPSTREAM = "upstream"
+
+
+def matches_distro_stock_version(version):
+    """Distro releases whose stock OpenSSH is exactly `version`.
+
+    Returns a list of (distro, codename); empty when the version belongs to no
+    known stock package. A bare "9.2p1" is Bookworm's stock OpenSSH, which
+    makes the host *probably* distro-managed -- evidence for lowering
+    confidence, never for asserting a patch level.
+    """
+    if not version:
+        return []
+    out = [("debian", c) for v, c in DEBIAN_OPENSSH_RELEASES.items() if v == version]
+    out += [("ubuntu", c) for v, c in UBUNTU_OPENSSH_RELEASES.items() if v == version]
+    return out
+
+
+def classify_patch_confidence(hint, version=None):
+    """Classify how far a service's patch level is externally knowable.
+
+    `hint` is a detect_distro_from_banner() result (or None); `version` is the
+    upstream version string. Returns one of the PATCH_* constants.
+    """
+    if hint:
+        # A package revision is the only direct evidence of a patch level.
+        if hint.get("package_revision"):
+            return PATCH_CONFIRMED
+        # el-family: the version is frozen per major and fixes ship as RPM
+        # release bumps, so a resolved release IS the patch context. This is
+        # the established Tier-1 path and is deliberately left confident.
+        if hint.get("distro") == "rhel" and hint.get("distro_release"):
+            return PATCH_CONFIRMED
+        # Distro-tagged but no revision, e.g. "Apache/2.4.57 (Debian)".
+        return PATCH_LEVEL_UNKNOWN
+
+    if matches_distro_stock_version(version):
+        return PATCH_LEVEL_UNKNOWN
+
+    return PATCH_UPSTREAM
+
+
 def get_osv_ecosystem(distro, distro_release):
     """Map distro + release codename to OSV ecosystem string.
 
