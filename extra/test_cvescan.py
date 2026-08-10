@@ -35,6 +35,10 @@ from cvescan import (
     VERSION,
 )
 from distro import (
+    PATCH_CONFIRMED,
+    PATCH_LEVEL_UNKNOWN,
+    PATCH_UPSTREAM,
+    classify_patch_confidence,
     detect_debian_release,
     detect_distro_from_banner,
     detect_rhel_httpd_release,
@@ -42,6 +46,7 @@ from distro import (
     detect_ubuntu_release,
     get_osv_ecosystem,
     get_osv_ecosystem_parts,
+    matches_distro_stock_version,
 )
 from dpkg_version import compare_dpkg_versions, parse_dpkg_version
 from ssh_fingerprint import (
@@ -1059,6 +1064,47 @@ class TestDistroDetection(unittest.TestCase):
     def test_empty_banner(self):
         self.assertIsNone(detect_distro_from_banner(""))
         self.assertIsNone(detect_distro_from_banner(None))
+
+
+class TestPatchConfidence(unittest.TestCase):
+    """How far a banner supports a patch-level claim."""
+
+    def test_tagged_banner_is_confirmed(self):
+        hint = detect_distro_from_banner("OpenSSH_9.6p1 Ubuntu 3ubuntu13.16")
+        self.assertEqual(classify_patch_confidence(hint, "9.6p1"), PATCH_CONFIRMED)
+
+    def test_rhel_frozen_version_is_confirmed(self):
+        # el freezes the version and ships fixes as RPM release bumps, so a
+        # resolved el major IS the patch context.
+        hint = detect_distro_from_banner("OpenSSH_8.0")
+        self.assertEqual(classify_patch_confidence(hint, "8.0"), PATCH_CONFIRMED)
+
+    def test_stripped_banner_on_stock_version_is_unknown(self):
+        # wastebox.biz: DebianBanner no. 9.2p1 is Bookworm's stock OpenSSH, so
+        # the host is evidently distro-managed but discloses no patch level.
+        self.assertEqual(
+            classify_patch_confidence(None, "9.2p1"), PATCH_LEVEL_UNKNOWN)
+
+    def test_os_tag_without_revision_is_unknown(self):
+        hint = detect_distro_from_banner("Apache/2.4.57 (Debian)")
+        self.assertEqual(
+            classify_patch_confidence(hint, "2.4.57"), PATCH_LEVEL_UNKNOWN)
+
+    def test_non_stock_version_is_upstream(self):
+        # 9.4p1 is no distro's stock OpenSSH — a self-compiled build, where
+        # upstream range matching means exactly what it says.
+        self.assertEqual(classify_patch_confidence(None, "9.4p1"), PATCH_UPSTREAM)
+
+    def test_no_version_is_upstream(self):
+        self.assertEqual(classify_patch_confidence(None, None), PATCH_UPSTREAM)
+
+    def test_matches_distro_stock_version(self):
+        self.assertEqual(matches_distro_stock_version("9.2p1"),
+                         [("debian", "bookworm")])
+        self.assertEqual(matches_distro_stock_version("9.6p1"),
+                         [("ubuntu", "noble")])
+        self.assertEqual(matches_distro_stock_version("9.4p1"), [])
+        self.assertEqual(matches_distro_stock_version(""), [])
 
 
 class TestDebianRelease(unittest.TestCase):
