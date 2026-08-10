@@ -35,6 +35,10 @@ from cvescan import (
     VERSION,
 )
 from distro import (
+    SUPPORT_EOL,
+    SUPPORT_EXTENDED,
+    SUPPORT_SUPPORTED,
+    release_support_status,
     detect_debian_release,
     detect_distro_from_banner,
     detect_rhel_httpd_release,
@@ -1314,6 +1318,51 @@ class TestCryptoAnnotateConfidence(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Tests: Red Hat securitydata backfill parse helpers
 # ---------------------------------------------------------------------------
+
+class TestReleaseSupportStatus(unittest.TestCase):
+    """Backport feeds stop when a release does; the lifecycle says when."""
+
+    TODAY = "2026-08-10"
+
+    def phase(self, distro, release, today=None):
+        st = release_support_status(distro, release, today or self.TODAY)
+        return st["phase"] if st else None
+
+    def test_buster_is_past_free_support(self):
+        # The case that started this: buster has no free CVE-keyed backport
+        # source left because free support ended in 2024.
+        self.assertEqual(self.phase("debian", "buster"), SUPPORT_EXTENDED)
+
+    def test_stretch_is_fully_eol(self):
+        self.assertEqual(self.phase("debian", "stretch", "2028-01-01"),
+                         SUPPORT_EOL)
+
+    def test_current_releases_are_supported(self):
+        self.assertEqual(self.phase("debian", "bookworm"), SUPPORT_SUPPORTED)
+        self.assertEqual(self.phase("ubuntu", "noble"), SUPPORT_SUPPORTED)
+        self.assertEqual(self.phase("rhel", "9"), SUPPORT_SUPPORTED)
+
+    def test_focal_needs_ubuntu_pro(self):
+        # Standard support ended 2025-05-31; only ESM ships fixes now.
+        st = release_support_status("ubuntu", "focal", self.TODAY)
+        self.assertEqual(st["phase"], SUPPORT_EXTENDED)
+        self.assertEqual(st["extended_name"], "Ubuntu Pro (ESM)")
+
+    def test_interim_release_has_no_extension(self):
+        st = release_support_status("ubuntu", "mantic", self.TODAY)
+        self.assertEqual(st["phase"], SUPPORT_EOL)
+        self.assertIsNone(st["extended_end"])
+
+    def test_boundary_day_is_still_supported(self):
+        self.assertEqual(self.phase("debian", "bullseye", "2026-08-31"),
+                         SUPPORT_SUPPORTED)
+        self.assertEqual(self.phase("debian", "bullseye", "2026-09-01"),
+                         SUPPORT_EXTENDED)
+
+    def test_unknown_release_is_not_guessed(self):
+        self.assertIsNone(release_support_status("debian", "nonesuch"))
+        self.assertIsNone(release_support_status("alpine", "3.20"))
+
 
 class TestUbuntuBackport(unittest.TestCase):
     """Canonical's tracker is the primary Ubuntu source: OSV's Ubuntu feed is

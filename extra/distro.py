@@ -290,6 +290,91 @@ def detect_distro_from_banner(banner):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Release support lifecycle
+#
+# Backport suppression needs a security feed, and feeds stop when a release
+# does. Debian buster is the clearest case: its data has aged out of both the
+# OSV bucket (which holds DSA/DLA advisory records carrying no CVE aliases, so
+# they cannot be joined to a CVE-keyed lookup) and the Debian Security
+# Tracker's live JSON (which now covers only bullseye onwards). No free
+# CVE-keyed backport source for it exists.
+#
+# That is not a gap to paper over: a release past its free security support is
+# not receiving fixes at all, which matters more to the reader than any
+# per-CVE verdict. Recording the lifecycle turns a silent hole into a finding,
+# and it is also why EOL hosts need no confidence carve-out — for them the
+# "still affected" reading of a version match is simply correct.
+#
+# (distro, codename|major) → (free_security_end, extended_end, extended_name)
+# Dates are the end of *free* security support; extended programmes are
+# commercial and cannot be assumed to be in place.
+# ---------------------------------------------------------------------------
+
+SUPPORT_SUPPORTED = "supported"
+SUPPORT_EXTENDED = "extended"   # free support over; paid programme may cover it
+SUPPORT_EOL = "eol"             # no support at all, free or paid
+
+RELEASE_SUPPORT = {
+    # Debian: "free security end" is the end of LTS, which is community-run
+    # but free. Beyond that only Freexian's commercial ELTS applies.
+    ("debian", "stretch"): ("2022-06-30", "2027-06-30", "Debian ELTS"),
+    ("debian", "buster"): ("2024-06-30", "2029-06-30", "Debian ELTS"),
+    ("debian", "bullseye"): ("2026-08-31", "2031-06-30", "Debian ELTS"),
+    ("debian", "bookworm"): ("2028-06-30", None, None),
+    ("debian", "trixie"): ("2030-06-30", None, None),
+    # Ubuntu LTS: free standard support, then ESM (Ubuntu Pro — free for
+    # personal use, paid for organisations).
+    ("ubuntu", "bionic"): ("2023-05-31", "2028-04-30", "Ubuntu Pro (ESM)"),
+    ("ubuntu", "focal"): ("2025-05-31", "2030-04-30", "Ubuntu Pro (ESM)"),
+    ("ubuntu", "jammy"): ("2027-06-01", "2032-04-30", "Ubuntu Pro (ESM)"),
+    ("ubuntu", "noble"): ("2029-06-01", "2034-04-30", "Ubuntu Pro (ESM)"),
+    # Ubuntu interim releases get nine months and no extension.
+    ("ubuntu", "kinetic"): ("2023-07-20", None, None),
+    ("ubuntu", "lunar"): ("2024-01-25", None, None),
+    ("ubuntu", "mantic"): ("2024-07-11", None, None),
+    # el family: maintenance support, then commercial ELS.
+    ("rhel", "7"): ("2024-06-30", "2028-06-30", "Red Hat ELS"),
+    ("rhel", "8"): ("2029-05-31", None, None),
+    ("rhel", "9"): ("2032-05-31", None, None),
+    ("rhel", "10"): ("2035-05-31", None, None),
+}
+
+
+def release_support_status(distro, release, today=None):
+    """Support lifecycle for a distro release, or None if unknown.
+
+    `today` is an ISO date string, defaulting to the current UTC date; passing
+    it explicitly keeps callers and tests deterministic.
+
+    Returns {phase, free_security_end, extended_end, extended_name}, where
+    phase is supported / extended / eol. `extended` means free support has
+    ended and only a commercial programme (ESM/ELTS/ELS) still ships fixes —
+    the host may or may not be enrolled, which is not visible from outside, so
+    it is reported as its own state rather than folded into either neighbour.
+    """
+    entry = RELEASE_SUPPORT.get((distro, release))
+    if not entry:
+        return None
+    free_end, extended_end, extended_name = entry
+    if today is None:
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).date().isoformat()
+
+    if today <= free_end:
+        phase = SUPPORT_SUPPORTED
+    elif extended_end and today <= extended_end:
+        phase = SUPPORT_EXTENDED
+    else:
+        phase = SUPPORT_EOL
+    return {
+        "phase": phase,
+        "free_security_end": free_end,
+        "extended_end": extended_end,
+        "extended_name": extended_name,
+    }
+
+
 def get_osv_ecosystem(distro, distro_release):
     """Map distro + release codename to OSV ecosystem string.
 
