@@ -13,6 +13,9 @@ DEBIAN_RELEASES = {
     "deb11": ("bullseye", "11"),
     "deb10": ("buster", "10"),
     "deb9": ("stretch", "9"),
+    "deb8": ("jessie", "8"),
+    "deb7": ("wheezy", "7"),
+    "deb6": ("squeeze", "6"),
 }
 
 # Ubuntu revision patterns → (codename, version)
@@ -37,11 +40,14 @@ UBUNTU_RELEASES = {
 # A bare banner (DebianBanner no) must stay unresolved — matching a stock
 # version there would assert a patch level the banner does not carry.
 UBUNTU_OPENSSH_RELEASES = {
+    "6.6.1p1": "trusty",
+    "7.2p2": "xenial",
     "7.6p1": "bionic",
     "8.2p1": "focal",
     "8.9p1": "jammy",
     "9.3p1": "mantic",
     "9.6p1": "noble",
+    "9.7p1": "oracular",
 }
 DEBIAN_OPENSSH_RELEASES = {
     "7.4p1": "stretch",
@@ -163,6 +169,12 @@ def detect_debian_release(revision, version=None):
     """
     for tag, (codename, _) in DEBIAN_RELEASES.items():
         if tag in revision:
+            return codename
+    # Older revisions spell the codename out ("6+squeeze7") rather than using
+    # the +debN tag, so try that before falling back to the stock version.
+    rev_lower = revision.lower()
+    for _tag, (codename, _) in DEBIAN_RELEASES.items():
+        if codename in rev_lower:
             return codename
     return DEBIAN_OPENSSH_RELEASES.get(version or "")
 
@@ -318,6 +330,9 @@ SUPPORT_EOL = "eol"             # no support at all, free or paid
 RELEASE_SUPPORT = {
     # Debian: "free security end" is the end of LTS, which is community-run
     # but free. Beyond that only Freexian's commercial ELTS applies.
+    ("debian", "squeeze"): ("2016-02-29", None, None),
+    ("debian", "wheezy"): ("2018-05-31", None, None),
+    ("debian", "jessie"): ("2020-06-30", "2025-06-30", "Debian ELTS"),
     ("debian", "stretch"): ("2022-06-30", "2027-06-30", "Debian ELTS"),
     ("debian", "buster"): ("2024-06-30", "2029-06-30", "Debian ELTS"),
     ("debian", "bullseye"): ("2026-08-31", "2031-06-30", "Debian ELTS"),
@@ -325,6 +340,8 @@ RELEASE_SUPPORT = {
     ("debian", "trixie"): ("2030-06-30", None, None),
     # Ubuntu LTS: free standard support, then ESM (Ubuntu Pro — free for
     # personal use, paid for organisations).
+    ("ubuntu", "trusty"): ("2019-04-30", "2024-04-30", "Ubuntu Pro (ESM)"),
+    ("ubuntu", "xenial"): ("2021-04-30", "2026-04-30", "Ubuntu Pro (ESM)"),
     ("ubuntu", "bionic"): ("2023-05-31", "2028-04-30", "Ubuntu Pro (ESM)"),
     ("ubuntu", "focal"): ("2025-05-31", "2030-04-30", "Ubuntu Pro (ESM)"),
     ("ubuntu", "jammy"): ("2027-06-01", "2032-04-30", "Ubuntu Pro (ESM)"),
@@ -333,6 +350,7 @@ RELEASE_SUPPORT = {
     ("ubuntu", "kinetic"): ("2023-07-20", None, None),
     ("ubuntu", "lunar"): ("2024-01-25", None, None),
     ("ubuntu", "mantic"): ("2024-07-11", None, None),
+    ("ubuntu", "oracular"): ("2025-07-10", None, None),
     # el family: maintenance support, then commercial ELS.
     ("rhel", "7"): ("2024-06-30", "2028-06-30", "Red Hat ELS"),
     ("rhel", "8"): ("2029-05-31", None, None),

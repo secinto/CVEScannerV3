@@ -1359,6 +1359,18 @@ class TestReleaseSupportStatus(unittest.TestCase):
         self.assertEqual(self.phase("debian", "bullseye", "2026-09-01"),
                          SUPPORT_EXTENDED)
 
+    def test_long_dead_releases_resolve(self):
+        # These are the hosts the lifecycle exists for. Before the maps
+        # covered them they fell through to "unknown" and got no notice at
+        # all — the oldest systems in the estate were the ones going unsaid.
+        self.assertEqual(detect_debian_release("5+deb8u8"), "jessie")
+        self.assertEqual(detect_debian_release("6+squeeze7"), "squeeze")
+        self.assertEqual(detect_ubuntu_release("4ubuntu2.10", "7.2p2"), "xenial")
+        self.assertEqual(detect_ubuntu_release("2ubuntu2.13", "6.6.1p1"), "trusty")
+        for distro, rel in (("debian", "jessie"), ("debian", "squeeze"),
+                            ("ubuntu", "xenial"), ("ubuntu", "trusty")):
+            self.assertEqual(self.phase(distro, rel), SUPPORT_EOL, (distro, rel))
+
     def test_unknown_release_is_not_guessed(self):
         self.assertIsNone(release_support_status("debian", "nonesuch"))
         self.assertIsNone(release_support_status("alpine", "3.20"))
