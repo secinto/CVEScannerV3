@@ -49,6 +49,12 @@ from ssh_fingerprint import (
     analyze_ssh_crypto,
     crypto_from_service,
 )
+from ubuntu_backport import (
+    ubuntu_disposition,
+    ubuntu_fixed_version,
+    ubuntu_release,
+    ubuntu_rows_for_cve,
+)
 from redhat_backport import (
     is_not_affected,
     rh_disposition,
@@ -1308,6 +1314,92 @@ class TestCryptoAnnotateConfidence(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Tests: Red Hat securitydata backfill parse helpers
 # ---------------------------------------------------------------------------
+
+class TestUbuntuBackport(unittest.TestCase):
+    """Canonical's tracker is the primary Ubuntu source: OSV's Ubuntu feed is
+    USN-derived and so carries no not-affected verdicts or silent SRU fixes."""
+
+    # Shape of one entry from ubuntu.com/security/cves.json?package=openssh
+    ENTRY = {
+        "id": "CVE-2024-6387",
+        "packages": [
+            {"name": "openssh", "statuses": [
+                {"release_codename": "noble", "status": "released",
+                 "description": "1:9.6p1-3ubuntu13.3"},
+                {"release_codename": "focal", "status": "not-affected",
+                 "description": "introduced in v8.5p1"},
+                {"release_codename": "jammy", "status": "released",
+                 "description": "1:8.9p1-3ubuntu0.10"},
+                {"release_codename": "trusty", "status": "needs-triage",
+                 "description": ""},
+            ]},
+            # A separate source package Canonical explicitly does not support.
+            {"name": "openssh-ssh1", "statuses": [
+                {"release_codename": "noble", "status": "ignored",
+                 "description": "end of standard support"},
+            ]},
+        ],
+    }
+
+    def rows(self, releases=("24.04", "22.04", "20.04")):
+        return list(ubuntu_rows_for_cve(self.ENTRY, "openssh", releases))
+
+    def test_released_yields_fixed_version(self):
+        by_release = {r[1]: r for r in self.rows()}
+        self.assertEqual(by_release["24.04"][2], "1:9.6p1-3ubuntu13.3")
+        self.assertEqual(by_release["24.04"][3], "fixed")
+
+    def test_not_affected_is_recorded_without_version(self):
+        by_release = {r[1]: r for r in self.rows()}
+        self.assertEqual(by_release["20.04"][3], "not_affected")
+        self.assertIsNone(by_release["20.04"][2])
+
+    def test_needs_triage_is_skipped(self):
+        # trusty is needs-triage; unknown is not a verdict. It is also outside
+        # the requested releases, so ask for it explicitly.
+        self.assertEqual(
+            [r for r in ubuntu_rows_for_cve(self.ENTRY, "openssh", ("14.04",))],
+            [])
+
+    def test_other_source_package_is_not_folded_in(self):
+        # openssh-ssh1's "ignored" must not become an openssh verdict.
+        self.assertNotIn("wont_fix", [r[3] for r in self.rows()])
+        rows = list(ubuntu_rows_for_cve(self.ENTRY, "openssh-ssh1", ("24.04",)))
+        self.assertEqual([r[3] for r in rows], ["wont_fix"])
+
+    def test_releases_outside_the_request_are_ignored(self):
+        self.assertEqual({r[1] for r in self.rows(("24.04",))}, {"24.04"})
+
+    def test_prose_description_is_not_taken_as_a_version(self):
+        self.assertIsNone(ubuntu_fixed_version("released", "needs backport"))
+        self.assertIsNone(ubuntu_fixed_version("not-affected", "1:9.6p1-3"))
+        self.assertEqual(
+            ubuntu_fixed_version("released", "1:9.6p1-3ubuntu13.3"),
+            "1:9.6p1-3ubuntu13.3")
+
+    def test_released_without_a_usable_version_is_dropped(self):
+        # A fix we cannot version-compare is not a usable fix record.
+        entry = {"id": "CVE-2020-0001", "packages": [
+            {"name": "openssh", "statuses": [
+                {"release_codename": "noble", "status": "released",
+                 "description": "see USN"}]}]}
+        self.assertEqual(list(ubuntu_rows_for_cve(entry, "openssh", ("24.04",))), [])
+
+    def test_disposition_and_release_mapping(self):
+        self.assertEqual(ubuntu_disposition("released"), "fixed")
+        self.assertEqual(ubuntu_disposition("not-affected"), "not_affected")
+        self.assertEqual(ubuntu_disposition("ignored"), "wont_fix")
+        self.assertEqual(ubuntu_disposition("deferred"), "fix_deferred")
+        self.assertEqual(ubuntu_disposition("needed"), "affected")
+        self.assertIsNone(ubuntu_disposition("DNE"))
+        self.assertIsNone(ubuntu_disposition("needs-triage"))
+        self.assertEqual(ubuntu_release("noble"), "24.04")
+        self.assertIsNone(ubuntu_release("nonesuch"))
+
+    def test_non_cve_ids_are_rejected(self):
+        entry = dict(self.ENTRY, id="USN-1234-1")
+        self.assertEqual(list(ubuntu_rows_for_cve(entry, "openssh", ("24.04",))), [])
+
 
 class TestRedhatBackport(unittest.TestCase):
     def test_fixed_version_el8(self):
