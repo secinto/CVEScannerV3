@@ -566,6 +566,25 @@ def _get_cpe_vendor_product(service):
     return None, service.get("product")
 
 
+def _resolve_pkg_name(value, release):
+    """Resolve a cpe-to-package entry to the source package for one release.
+
+    Ubuntu renames a source package whenever the distro pins a major version:
+    MariaDB ships as mariadb-10.3 on 20.04, mariadb-10.6 on 22.04 and plain
+    mariadb on 24.04. A flat name therefore matches exactly one release and
+    silently misses the others — the backports rows are there, keyed by each
+    release's own source name, and the lookup simply never asks for them.
+
+    Accepts either the flat string form (unchanged, still the common case) or
+    a per-release mapping with a "default":
+
+        "ubuntu": {"default": "mariadb", "22.04": "mariadb-10.6"}
+    """
+    if isinstance(value, dict):
+        return value.get(release) or value.get("default")
+    return value
+
+
 def check_backports(cur, cve_ids, distro, distro_release, cpe_vendor,
                     cpe_product, cpe_to_pkg, installed_version=None):
     """Check backport database for patched CVEs.
@@ -585,13 +604,13 @@ def check_backports(cur, cve_ids, distro, distro_release, cpe_vendor,
     if cpe_vendor and cpe_product:
         key = f"{cpe_vendor}:{cpe_product}"
         mapping = cpe_to_pkg.get(key, {})
-        pkg_name = mapping.get(distro)
+        pkg_name = _resolve_pkg_name(mapping.get(distro), osv_release)
 
     # Fallback: try all entries matching just the product name
     if not pkg_name and cpe_product:
         for map_key, map_val in cpe_to_pkg.items():
             if map_key.endswith(f":{cpe_product}"):
-                pkg_name = map_val.get(distro)
+                pkg_name = _resolve_pkg_name(map_val.get(distro), osv_release)
                 if pkg_name:
                     break
 

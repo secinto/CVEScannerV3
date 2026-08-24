@@ -35,7 +35,11 @@
   },
   "mariadb:mariadb": {
     "debian": "mariadb",
-    "ubuntu": "mariadb"
+    "ubuntu": {
+      "default": "mariadb",
+      "22.04": "mariadb-10.6",
+      "20.04": "mariadb-10.3"
+    }
   },
   "postgresql:postgresql": {
     "debian": "postgresql-16",

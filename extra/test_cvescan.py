@@ -19,6 +19,7 @@ from cvescan import (
     _load_cpe_to_pkg,
     annotate_confidence,
     check_backports,
+    _resolve_pkg_name,
     compare_version,
     diagnose_no_match,
     find_vulnerabilities,
@@ -1692,6 +1693,99 @@ class TestDpkgVersionCompare(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Tests: Backport checking
 # ---------------------------------------------------------------------------
+
+
+class TestResolvePkgName(unittest.TestCase):
+    """Ubuntu renames source packages per release; the lookup must follow."""
+
+    UBUNTU_MARIADB = {"default": "mariadb", "22.04": "mariadb-10.6",
+                      "20.04": "mariadb-10.3"}
+
+    def test_flat_string_is_returned_unchanged(self):
+        """The common case: one name for every release."""
+        self.assertEqual(_resolve_pkg_name("openssh", "24.04"), "openssh")
+        self.assertEqual(_resolve_pkg_name("openssh", "20.04"), "openssh")
+
+    def test_per_release_name_wins(self):
+        self.assertEqual(_resolve_pkg_name(self.UBUNTU_MARIADB, "22.04"),
+                         "mariadb-10.6")
+        self.assertEqual(_resolve_pkg_name(self.UBUNTU_MARIADB, "20.04"),
+                         "mariadb-10.3")
+
+    def test_falls_back_to_default(self):
+        """A release with no override uses default, not None."""
+        self.assertEqual(_resolve_pkg_name(self.UBUNTU_MARIADB, "24.04"),
+                         "mariadb")
+        self.assertEqual(_resolve_pkg_name(self.UBUNTU_MARIADB, "18.04"),
+                         "mariadb")
+
+    def test_none_stays_none(self):
+        self.assertIsNone(_resolve_pkg_name(None, "24.04"))
+
+    def test_mapping_without_default_returns_none_for_unknown_release(self):
+        self.assertIsNone(_resolve_pkg_name({"22.04": "mariadb-10.6"}, "24.04"))
+
+
+class TestCheckBackportsPerReleasePackage(unittest.TestCase):
+    """Regression: 380 MariaDB rows sat unreachable in a shipped cve.db.
+
+    cpe-to-package.json mapped mariadb:mariadb -> "mariadb" for every Ubuntu
+    release, but the backports rows are keyed by each release's own source
+    name. 24.04 matched; 22.04 (mariadb-10.6) and 20.04 (mariadb-10.3) found
+    nothing and every CVE came back unsuppressed.
+    """
+
+    CPE_TO_PKG = {"mariadb:mariadb": {
+        "ubuntu": {"default": "mariadb", "22.04": "mariadb-10.6",
+                   "20.04": "mariadb-10.3"}}}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.conn = create_test_db()
+        cls.cur = cls.conn.cursor()
+        cls.cur.executemany(
+            "INSERT OR REPLACE INTO backports (cve_id, distro, release, package, "
+            "fixed_version, status) VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("CVE-2024-0001", "Ubuntu", "24.04", "mariadb",
+                 "1:10.11.8-0ubuntu0.24.04.1", "fixed"),
+                ("CVE-2024-0001", "Ubuntu", "22.04", "mariadb-10.6",
+                 "1:10.6.18-0ubuntu0.22.04.1", "fixed"),
+                ("CVE-2024-0001", "Ubuntu", "20.04", "mariadb-10.3",
+                 "1:10.3.39-0ubuntu0.20.04.2", "fixed"),
+            ],
+        )
+        cls.conn.commit()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.cur.close()
+        cls.conn.close()
+
+    def _status(self, codename, installed):
+        return check_backports(
+            self.cur, ["CVE-2024-0001"], "ubuntu", codename,
+            "mariadb", "mariadb", self.CPE_TO_PKG,
+            installed_version=installed,
+        )["CVE-2024-0001"]
+
+    def test_noble_uses_the_default_name(self):
+        self.assertEqual(self._status("noble", "1:10.11.8-0ubuntu0.24.04.1")["status"],
+                         "patched")
+
+    def test_jammy_finds_the_versioned_name(self):
+        """Was unreachable: looked up "mariadb", rows are under mariadb-10.6."""
+        self.assertEqual(self._status("jammy", "1:10.6.18-0ubuntu0.22.04.1")["status"],
+                         "patched")
+
+    def test_focal_finds_the_versioned_name(self):
+        self.assertEqual(self._status("focal", "1:10.3.39-0ubuntu0.20.04.2")["status"],
+                         "patched")
+
+    def test_jammy_still_reports_an_unpatched_host(self):
+        """Resolving the name must not turn every jammy host into "patched"."""
+        self.assertNotEqual(self._status("jammy", "1:10.6.7-0ubuntu0.22.04.1")["status"],
+                            "patched")
 
 class TestCheckBackports(unittest.TestCase):
     @classmethod
