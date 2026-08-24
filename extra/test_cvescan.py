@@ -35,6 +35,14 @@ from cvescan import (
     VERSION,
 )
 from distro import (
+    PATCH_CONFIRMED,
+    PATCH_LEVEL_UNKNOWN,
+    PATCH_UPSTREAM,
+    SUPPORT_EOL,
+    SUPPORT_EXTENDED,
+    SUPPORT_SUPPORTED,
+    classify_patch_confidence,
+    release_support_status,
     detect_debian_release,
     detect_distro_from_banner,
     detect_rhel_httpd_release,
@@ -42,12 +50,19 @@ from distro import (
     detect_ubuntu_release,
     get_osv_ecosystem,
     get_osv_ecosystem_parts,
+    matches_distro_stock_version,
 )
 from dpkg_version import compare_dpkg_versions, parse_dpkg_version
 from ssh_fingerprint import (
     TERRAPIN_CVE,
     analyze_ssh_crypto,
     crypto_from_service,
+)
+from ubuntu_backport import (
+    ubuntu_disposition,
+    ubuntu_fixed_version,
+    ubuntu_release,
+    ubuntu_rows_for_cve,
 )
 from redhat_backport import (
     is_not_affected,
@@ -364,6 +379,28 @@ class TestParseVersion(unittest.TestCase):
         info = parse_version("for_windows_4.7")
         self.assertEqual(info["ver"], "4.7")
         self.assertEqual(info["vup"], "*")
+
+    def test_open_bound_is_not_a_version(self):
+        # nmap says "2.0.0 or later" when it can place HAProxy but not its
+        # build. Read literally that pins the host to the oldest build in the
+        # range and scores it for every CVE fixed since — every one of the
+        # corpus's 298 HAProxy detections is such a bound.
+        for v in ("2.0.0 or later", "9.6.0 or later", "10.3.23 or earlier",
+                  "1.2 or newer"):
+            info = parse_version(v)
+            self.assertTrue(info["empty"], v)
+            self.assertEqual(info["ver"], "*", v)
+
+    def test_numeric_range_still_parses_as_a_range(self):
+        # A closed range is usable and must not be swept up with open bounds.
+        info = parse_version("1.3.1 - 1.9.0")
+        self.assertTrue(info["range_"])
+        self.assertEqual(info["from_"], "1.3.1")
+        self.assertEqual(info["to_"], "1.9.0")
+
+    def test_ordinary_versions_are_untouched(self):
+        self.assertEqual(parse_version("2.4.22")["ver"], "2.4.22")
+        self.assertEqual(parse_version("9.6p1")["ver"], "9.6")
 
     def test_mariadb_compat_prefix_stripped(self):
         # Real nmap output for a MariaDB 10.11 host. Without the strip the
@@ -1061,6 +1098,47 @@ class TestDistroDetection(unittest.TestCase):
         self.assertIsNone(detect_distro_from_banner(None))
 
 
+class TestPatchConfidence(unittest.TestCase):
+    """How far a banner supports a patch-level claim."""
+
+    def test_tagged_banner_is_confirmed(self):
+        hint = detect_distro_from_banner("OpenSSH_9.6p1 Ubuntu 3ubuntu13.16")
+        self.assertEqual(classify_patch_confidence(hint, "9.6p1"), PATCH_CONFIRMED)
+
+    def test_rhel_frozen_version_is_confirmed(self):
+        # el freezes the version and ships fixes as RPM release bumps, so a
+        # resolved el major IS the patch context.
+        hint = detect_distro_from_banner("OpenSSH_8.0")
+        self.assertEqual(classify_patch_confidence(hint, "8.0"), PATCH_CONFIRMED)
+
+    def test_stripped_banner_on_stock_version_is_unknown(self):
+        # wastebox.biz: DebianBanner no. 9.2p1 is Bookworm's stock OpenSSH, so
+        # the host is evidently distro-managed but discloses no patch level.
+        self.assertEqual(
+            classify_patch_confidence(None, "9.2p1"), PATCH_LEVEL_UNKNOWN)
+
+    def test_os_tag_without_revision_is_unknown(self):
+        hint = detect_distro_from_banner("Apache/2.4.57 (Debian)")
+        self.assertEqual(
+            classify_patch_confidence(hint, "2.4.57"), PATCH_LEVEL_UNKNOWN)
+
+    def test_non_stock_version_is_upstream(self):
+        # 9.4p1 is no distro's stock OpenSSH — a self-compiled build, where
+        # upstream range matching means exactly what it says.
+        self.assertEqual(classify_patch_confidence(None, "9.4p1"), PATCH_UPSTREAM)
+
+    def test_no_version_is_upstream(self):
+        self.assertEqual(classify_patch_confidence(None, None), PATCH_UPSTREAM)
+
+    def test_matches_distro_stock_version(self):
+        self.assertEqual(matches_distro_stock_version("9.2p1"),
+                         [("debian", "bookworm")])
+        self.assertEqual(matches_distro_stock_version("9.6p1"),
+                         [("ubuntu", "noble")])
+        self.assertEqual(matches_distro_stock_version("9.4p1"), [])
+        self.assertEqual(matches_distro_stock_version(""), [])
+
+
 class TestDebianRelease(unittest.TestCase):
     def test_deb12(self):
         self.assertEqual(detect_debian_release("2+deb12u7"), "bookworm")
@@ -1308,6 +1386,149 @@ class TestCryptoAnnotateConfidence(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Tests: Red Hat securitydata backfill parse helpers
 # ---------------------------------------------------------------------------
+
+class TestReleaseSupportStatus(unittest.TestCase):
+    """Backport feeds stop when a release does; the lifecycle says when."""
+
+    TODAY = "2026-08-10"
+
+    def phase(self, distro, release, today=None):
+        st = release_support_status(distro, release, today or self.TODAY)
+        return st["phase"] if st else None
+
+    def test_buster_is_past_free_support(self):
+        # The case that started this: buster has no free CVE-keyed backport
+        # source left because free support ended in 2024.
+        self.assertEqual(self.phase("debian", "buster"), SUPPORT_EXTENDED)
+
+    def test_stretch_is_fully_eol(self):
+        self.assertEqual(self.phase("debian", "stretch", "2028-01-01"),
+                         SUPPORT_EOL)
+
+    def test_current_releases_are_supported(self):
+        self.assertEqual(self.phase("debian", "bookworm"), SUPPORT_SUPPORTED)
+        self.assertEqual(self.phase("ubuntu", "noble"), SUPPORT_SUPPORTED)
+        self.assertEqual(self.phase("rhel", "9"), SUPPORT_SUPPORTED)
+
+    def test_focal_needs_ubuntu_pro(self):
+        # Standard support ended 2025-05-31; only ESM ships fixes now.
+        st = release_support_status("ubuntu", "focal", self.TODAY)
+        self.assertEqual(st["phase"], SUPPORT_EXTENDED)
+        self.assertEqual(st["extended_name"], "Ubuntu Pro (ESM)")
+
+    def test_interim_release_has_no_extension(self):
+        st = release_support_status("ubuntu", "mantic", self.TODAY)
+        self.assertEqual(st["phase"], SUPPORT_EOL)
+        self.assertIsNone(st["extended_end"])
+
+    def test_boundary_day_is_still_supported(self):
+        self.assertEqual(self.phase("debian", "bullseye", "2026-08-31"),
+                         SUPPORT_SUPPORTED)
+        self.assertEqual(self.phase("debian", "bullseye", "2026-09-01"),
+                         SUPPORT_EXTENDED)
+
+    def test_long_dead_releases_resolve(self):
+        # These are the hosts the lifecycle exists for. Before the maps
+        # covered them they fell through to "unknown" and got no notice at
+        # all — the oldest systems in the estate were the ones going unsaid.
+        self.assertEqual(detect_debian_release("5+deb8u8"), "jessie")
+        self.assertEqual(detect_debian_release("6+squeeze7"), "squeeze")
+        self.assertEqual(detect_ubuntu_release("4ubuntu2.10", "7.2p2"), "xenial")
+        self.assertEqual(detect_ubuntu_release("2ubuntu2.13", "6.6.1p1"), "trusty")
+        for distro, rel in (("debian", "jessie"), ("debian", "squeeze"),
+                            ("ubuntu", "xenial"), ("ubuntu", "trusty")):
+            self.assertEqual(self.phase(distro, rel), SUPPORT_EOL, (distro, rel))
+
+    def test_unknown_release_is_not_guessed(self):
+        self.assertIsNone(release_support_status("debian", "nonesuch"))
+        self.assertIsNone(release_support_status("alpine", "3.20"))
+
+
+class TestUbuntuBackport(unittest.TestCase):
+    """Canonical's tracker is the primary Ubuntu source: OSV's Ubuntu feed is
+    USN-derived and so carries no not-affected verdicts or silent SRU fixes."""
+
+    # Shape of one entry from ubuntu.com/security/cves.json?package=openssh
+    ENTRY = {
+        "id": "CVE-2024-6387",
+        "packages": [
+            {"name": "openssh", "statuses": [
+                {"release_codename": "noble", "status": "released",
+                 "description": "1:9.6p1-3ubuntu13.3"},
+                {"release_codename": "focal", "status": "not-affected",
+                 "description": "introduced in v8.5p1"},
+                {"release_codename": "jammy", "status": "released",
+                 "description": "1:8.9p1-3ubuntu0.10"},
+                {"release_codename": "trusty", "status": "needs-triage",
+                 "description": ""},
+            ]},
+            # A separate source package Canonical explicitly does not support.
+            {"name": "openssh-ssh1", "statuses": [
+                {"release_codename": "noble", "status": "ignored",
+                 "description": "end of standard support"},
+            ]},
+        ],
+    }
+
+    def rows(self, releases=("24.04", "22.04", "20.04")):
+        return list(ubuntu_rows_for_cve(self.ENTRY, "openssh", releases))
+
+    def test_released_yields_fixed_version(self):
+        by_release = {r[1]: r for r in self.rows()}
+        self.assertEqual(by_release["24.04"][2], "1:9.6p1-3ubuntu13.3")
+        self.assertEqual(by_release["24.04"][3], "fixed")
+
+    def test_not_affected_is_recorded_without_version(self):
+        by_release = {r[1]: r for r in self.rows()}
+        self.assertEqual(by_release["20.04"][3], "not_affected")
+        self.assertIsNone(by_release["20.04"][2])
+
+    def test_needs_triage_is_skipped(self):
+        # trusty is needs-triage; unknown is not a verdict. It is also outside
+        # the requested releases, so ask for it explicitly.
+        self.assertEqual(
+            [r for r in ubuntu_rows_for_cve(self.ENTRY, "openssh", ("14.04",))],
+            [])
+
+    def test_other_source_package_is_not_folded_in(self):
+        # openssh-ssh1's "ignored" must not become an openssh verdict.
+        self.assertNotIn("wont_fix", [r[3] for r in self.rows()])
+        rows = list(ubuntu_rows_for_cve(self.ENTRY, "openssh-ssh1", ("24.04",)))
+        self.assertEqual([r[3] for r in rows], ["wont_fix"])
+
+    def test_releases_outside_the_request_are_ignored(self):
+        self.assertEqual({r[1] for r in self.rows(("24.04",))}, {"24.04"})
+
+    def test_prose_description_is_not_taken_as_a_version(self):
+        self.assertIsNone(ubuntu_fixed_version("released", "needs backport"))
+        self.assertIsNone(ubuntu_fixed_version("not-affected", "1:9.6p1-3"))
+        self.assertEqual(
+            ubuntu_fixed_version("released", "1:9.6p1-3ubuntu13.3"),
+            "1:9.6p1-3ubuntu13.3")
+
+    def test_released_without_a_usable_version_is_dropped(self):
+        # A fix we cannot version-compare is not a usable fix record.
+        entry = {"id": "CVE-2020-0001", "packages": [
+            {"name": "openssh", "statuses": [
+                {"release_codename": "noble", "status": "released",
+                 "description": "see USN"}]}]}
+        self.assertEqual(list(ubuntu_rows_for_cve(entry, "openssh", ("24.04",))), [])
+
+    def test_disposition_and_release_mapping(self):
+        self.assertEqual(ubuntu_disposition("released"), "fixed")
+        self.assertEqual(ubuntu_disposition("not-affected"), "not_affected")
+        self.assertEqual(ubuntu_disposition("ignored"), "wont_fix")
+        self.assertEqual(ubuntu_disposition("deferred"), "fix_deferred")
+        self.assertEqual(ubuntu_disposition("needed"), "affected")
+        self.assertIsNone(ubuntu_disposition("DNE"))
+        self.assertIsNone(ubuntu_disposition("needs-triage"))
+        self.assertEqual(ubuntu_release("noble"), "24.04")
+        self.assertIsNone(ubuntu_release("nonesuch"))
+
+    def test_non_cve_ids_are_rejected(self):
+        entry = dict(self.ENTRY, id="USN-1234-1")
+        self.assertEqual(list(ubuntu_rows_for_cve(entry, "openssh", ("24.04",))), [])
+
 
 class TestRedhatBackport(unittest.TestCase):
     def test_fixed_version_el8(self):

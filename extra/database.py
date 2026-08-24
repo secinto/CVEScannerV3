@@ -632,6 +632,131 @@ from redhat_backport import (  # noqa: E402
     rh_fixed_version,
     rh_fix_state,
 )
+from ubuntu_backport import (  # noqa: E402
+    DEFINITIVE_DISPOSITIONS,
+    UBUNTU_SECURITY_API,
+    ubuntu_rows_for_cve,
+)
+
+
+# The Ubuntu security API rejects limit > 20 with HTTP 422, so this is a hard
+# ceiling rather than a tuning knob.
+UBUNTU_PAGE_SIZE = 20
+# It also rate-limits (HTTP 429) a burst of page requests. These bound the
+# retry/backoff so a rebuild degrades into "slow" rather than "empty".
+UBUNTU_MAX_RETRIES = 5
+UBUNTU_BACKOFF_BASE = 3.0
+UBUNTU_PAGE_PAUSE = 0.5
+
+
+def update_backports_ubuntu(db_path, releases=("24.04", "22.04", "20.04"),
+                            packages=("openssh",), page_size=UBUNTU_PAGE_SIZE):
+    """Backfill the backports table from Canonical's security tracker.
+
+    OSV's Ubuntu ecosystem only carries CVEs that got a published USN, so it
+    misses not-affected determinations and silent SRU fixes entirely — 5
+    openssh rows for 24.04 against Debian 12's 82. Canonical's tracker has the
+    full per-release picture and its list endpoint embeds the statuses, so one
+    paginated call per package suffices (no per-CVE detail fetch).
+
+    Rows land in the same Ubuntu:<release> bucket as the OSV data. Canonical is
+    upstream of that data, so its definitive verdicts (fixed / not_affected)
+    replace an existing row, while softer ones (affected / wont_fix /
+    fix_deferred) insert-or-ignore — a row already known to be fixed must never
+    be downgraded to affected.
+    """
+    page_size = min(page_size, UBUNTU_PAGE_SIZE)
+
+    def _get(url):
+        """GET with backoff on rate-limiting. Canonical answers a burst of page
+        requests with 429, so a naive loop silently yields zero rows."""
+        for attempt in range(UBUNTU_MAX_RETRIES):
+            resp = httpx.get(url, timeout=60, follow_redirects=True,
+                             headers={"User-Agent": "checkfix-cvescanner",
+                                      "Accept": "application/json"})
+            if resp.status_code not in (429, 500, 502, 503, 504):
+                resp.raise_for_status()
+                return resp.json()
+            if attempt == UBUNTU_MAX_RETRIES - 1:
+                resp.raise_for_status()
+            # Honour Retry-After when present, else exponential backoff.
+            try:
+                wait = float(resp.headers.get("Retry-After", ""))
+            except ValueError:
+                wait = 0.0
+            time.sleep(max(wait, UBUNTU_BACKOFF_BASE * (2 ** attempt)))
+        return None
+
+    with Database(db_path) as db:
+        db.setup()
+        total = 0
+        for package in packages:
+            entries, offset = [], 0
+            while True:
+                url = (f"{UBUNTU_SECURITY_API}/cves.json?package={package}"
+                       f"&limit={page_size}&offset={offset}")
+                try:
+                    page = _get(url)
+                except (httpx.HTTPError, httpx.TimeoutException, ValueError) as e:
+                    # Partial data is worse than none here: a missing page
+                    # would look like "Canonical has no verdict", which reads
+                    # as unfixed. Drop the package rather than half-record it.
+                    print(f"[!] Ubuntu fetch failed for {package} "
+                          f"(offset {offset}): {e} — skipping package")
+                    entries = []
+                    break
+                if page is None:
+                    entries = []
+                    break
+                batch = page.get("cves") or []
+                entries.extend(batch)
+                offset += len(batch)
+                # Stop on a short page or once the reported total is reached;
+                # both guard against an endpoint that ignores the offset.
+                if not batch or offset >= (page.get("total_results") or 0):
+                    break
+                time.sleep(UBUNTU_PAGE_PAUSE)
+
+            definitive, soft = [], []
+            for entry in entries:
+                for (cve_id, release, fixed, disposition, reason,
+                     citation) in ubuntu_rows_for_cve(entry, package, releases):
+                    row = (cve_id, "Ubuntu", release, package, fixed,
+                           disposition, reason, "ubuntu-security", citation)
+                    if disposition in DEFINITIVE_DISPOSITIONS:
+                        definitive.append(row)
+                    else:
+                        soft.append(row)
+
+            cols = ("INSERT OR {} INTO backports (cve_id, distro, release, "
+                    "package, fixed_version, status, reason, source, citation) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            db.cursor.executemany(cols.format("REPLACE"), definitive)
+            db.cursor.executemany(cols.format("IGNORE"), soft)
+            db.conn.commit()
+            total += len(definitive) + len(soft)
+            if not definitive and not soft:
+                # A misspelled or wrongly-versioned source package name returns
+                # an empty result set, not an error — Ubuntu's source names are
+                # not the CPE product names (exim -> exim4, mysql -> mysql-8.0).
+                # Left quiet, that reads as "nothing to suppress", which is
+                # indistinguishable from "this package is clean".
+                print(f"[!] Ubuntu {package}: no rows — check the source "
+                      f"package name ({len(entries)} CVEs returned)")
+            else:
+                print(f"[+] Ubuntu {package}: {len(definitive)} definitive + "
+                      f"{len(soft)} other rows ({len(entries)} CVEs scanned)")
+
+        for rel in releases:
+            db.cursor.execute(
+                "INSERT OR REPLACE INTO backport_metadata "
+                "(id, ecosystem, last_updated, record_count) VALUES ("
+                "(SELECT id FROM backport_metadata WHERE ecosystem = ?), "
+                "?, ?, ?)",
+                [f"UbuntuSecurity:{rel}", f"UbuntuSecurity:{rel}", now(), total],
+            )
+        db.conn.commit()
+    print(f"[+] Ubuntu security tracker backfill complete ({total} rows)")
 
 
 def _rh_cve_url(cve_id):
@@ -1178,7 +1303,9 @@ def update_exploitdb(args):
 def run_update(database, api_key, noscrape=False, full=False,
                backports=False, backports_only=False, ecosystems=None,
                redhat=False, redhat_packages=("openssh",),
-               redhat_releases=("8", "9"), curated_path=None):
+               redhat_releases=("8", "9"), curated_path=None,
+               ubuntu=False, ubuntu_packages=("openssh",),
+               ubuntu_releases=("24.04", "22.04", "20.04")):
     """Run the database create/update process.
 
     Args:
@@ -1208,6 +1335,9 @@ def run_update(database, api_key, noscrape=False, full=False,
         if redhat:
             update_backports_redhat(database, releases=redhat_releases,
                                     packages=redhat_packages)
+        if ubuntu:
+            update_backports_ubuntu(database, releases=ubuntu_releases,
+                                    packages=ubuntu_packages)
         if curated_path:
             load_curated_dispositions(database, curated_path)
         return
@@ -1248,6 +1378,9 @@ def run_update(database, api_key, noscrape=False, full=False,
         if redhat:
             update_backports_redhat(database, releases=redhat_releases,
                                     packages=redhat_packages)
+        if ubuntu:
+            update_backports_ubuntu(database, releases=ubuntu_releases,
+                                    packages=ubuntu_packages)
         if curated_path:
             load_curated_dispositions(database, curated_path)
 
@@ -1297,6 +1430,25 @@ if __name__ == "__main__":
         help="Comma-separated el releases for the Red Hat backfill (default: 8,9)",
     )
     parser.add_argument(
+        "--ubuntu",
+        action="store_true",
+        help="Also backfill Ubuntu backports from Canonical's security tracker "
+             "(OSV's Ubuntu feed is USN-only: no not-affected verdicts, no "
+             "silent SRU fixes)",
+    )
+    parser.add_argument(
+        "--ubuntu-packages",
+        default="openssh",
+        help="Comma-separated source packages for the Ubuntu backfill "
+             "(default: openssh)",
+    )
+    parser.add_argument(
+        "--ubuntu-releases",
+        default="24.04,22.04,20.04",
+        help="Comma-separated Ubuntu releases for the backfill "
+             "(default: 24.04,22.04,20.04)",
+    )
+    parser.add_argument(
         "--curated",
         help="Path to a curated disposition overlay JSON (highest precedence)",
     )
@@ -1308,6 +1460,8 @@ if __name__ == "__main__":
 
     redhat_packages = tuple(p.strip() for p in args.redhat_packages.split(",") if p.strip())
     redhat_releases = tuple(r.strip() for r in args.redhat_releases.split(",") if r.strip())
+    ubuntu_packages = tuple(p.strip() for p in args.ubuntu_packages.split(",") if p.strip())
+    ubuntu_releases = tuple(r.strip() for r in args.ubuntu_releases.split(",") if r.strip())
 
     api = Path(".api")
     if api.is_file():
@@ -1335,6 +1489,9 @@ if __name__ == "__main__":
             redhat=args.redhat,
             redhat_packages=redhat_packages,
             redhat_releases=redhat_releases,
+            ubuntu=args.ubuntu,
+            ubuntu_packages=ubuntu_packages,
+            ubuntu_releases=ubuntu_releases,
             curated_path=args.curated,
         )
     except DatabaseUpdateError as e:

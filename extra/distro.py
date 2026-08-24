@@ -13,6 +13,9 @@ DEBIAN_RELEASES = {
     "deb11": ("bullseye", "11"),
     "deb10": ("buster", "10"),
     "deb9": ("stretch", "9"),
+    "deb8": ("jessie", "8"),
+    "deb7": ("wheezy", "7"),
+    "deb6": ("squeeze", "6"),
 }
 
 # Ubuntu revision patterns → (codename, version)
@@ -37,11 +40,14 @@ UBUNTU_RELEASES = {
 # A bare banner (DebianBanner no) must stay unresolved — matching a stock
 # version there would assert a patch level the banner does not carry.
 UBUNTU_OPENSSH_RELEASES = {
+    "6.6.1p1": "trusty",
+    "7.2p2": "xenial",
     "7.6p1": "bionic",
     "8.2p1": "focal",
     "8.9p1": "jammy",
     "9.3p1": "mantic",
     "9.6p1": "noble",
+    "9.7p1": "oracular",
 }
 DEBIAN_OPENSSH_RELEASES = {
     "7.4p1": "stretch",
@@ -163,6 +169,12 @@ def detect_debian_release(revision, version=None):
     """
     for tag, (codename, _) in DEBIAN_RELEASES.items():
         if tag in revision:
+            return codename
+    # Older revisions spell the codename out ("6+squeeze7") rather than using
+    # the +debN tag, so try that before falling back to the stock version.
+    rev_lower = revision.lower()
+    for _tag, (codename, _) in DEBIAN_RELEASES.items():
+        if codename in rev_lower:
             return codename
     return DEBIAN_OPENSSH_RELEASES.get(version or "")
 
@@ -288,6 +300,156 @@ def detect_distro_from_banner(banner):
         }
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Release support lifecycle
+#
+# Backport suppression needs a security feed, and feeds stop when a release
+# does. Debian buster is the clearest case: its data has aged out of both the
+# OSV bucket (which holds DSA/DLA advisory records carrying no CVE aliases, so
+# they cannot be joined to a CVE-keyed lookup) and the Debian Security
+# Tracker's live JSON (which now covers only bullseye onwards). No free
+# CVE-keyed backport source for it exists.
+#
+# That is not a gap to paper over: a release past its free security support is
+# not receiving fixes at all, which matters more to the reader than any
+# per-CVE verdict. Recording the lifecycle turns a silent hole into a finding,
+# and it is also why EOL hosts need no confidence carve-out — for them the
+# "still affected" reading of a version match is simply correct.
+#
+# (distro, codename|major) → (free_security_end, extended_end, extended_name)
+# Dates are the end of *free* security support; extended programmes are
+# commercial and cannot be assumed to be in place.
+# ---------------------------------------------------------------------------
+
+SUPPORT_SUPPORTED = "supported"
+SUPPORT_EXTENDED = "extended"   # free support over; paid programme may cover it
+SUPPORT_EOL = "eol"             # no support at all, free or paid
+
+RELEASE_SUPPORT = {
+    # Debian: "free security end" is the end of LTS, which is community-run
+    # but free. Beyond that only Freexian's commercial ELTS applies.
+    ("debian", "squeeze"): ("2016-02-29", None, None),
+    ("debian", "wheezy"): ("2018-05-31", None, None),
+    ("debian", "jessie"): ("2020-06-30", "2025-06-30", "Debian ELTS"),
+    ("debian", "stretch"): ("2022-06-30", "2027-06-30", "Debian ELTS"),
+    ("debian", "buster"): ("2024-06-30", "2029-06-30", "Debian ELTS"),
+    ("debian", "bullseye"): ("2026-08-31", "2031-06-30", "Debian ELTS"),
+    ("debian", "bookworm"): ("2028-06-30", None, None),
+    ("debian", "trixie"): ("2030-06-30", None, None),
+    # Ubuntu LTS: free standard support, then ESM (Ubuntu Pro — free for
+    # personal use, paid for organisations).
+    ("ubuntu", "trusty"): ("2019-04-30", "2024-04-30", "Ubuntu Pro (ESM)"),
+    ("ubuntu", "xenial"): ("2021-04-30", "2026-04-30", "Ubuntu Pro (ESM)"),
+    ("ubuntu", "bionic"): ("2023-05-31", "2028-04-30", "Ubuntu Pro (ESM)"),
+    ("ubuntu", "focal"): ("2025-05-31", "2030-04-30", "Ubuntu Pro (ESM)"),
+    ("ubuntu", "jammy"): ("2027-06-01", "2032-04-30", "Ubuntu Pro (ESM)"),
+    ("ubuntu", "noble"): ("2029-06-01", "2034-04-30", "Ubuntu Pro (ESM)"),
+    # Ubuntu interim releases get nine months and no extension.
+    ("ubuntu", "kinetic"): ("2023-07-20", None, None),
+    ("ubuntu", "lunar"): ("2024-01-25", None, None),
+    ("ubuntu", "mantic"): ("2024-07-11", None, None),
+    ("ubuntu", "oracular"): ("2025-07-10", None, None),
+    # el family: maintenance support, then commercial ELS.
+    ("rhel", "7"): ("2024-06-30", "2028-06-30", "Red Hat ELS"),
+    ("rhel", "8"): ("2029-05-31", None, None),
+    ("rhel", "9"): ("2032-05-31", None, None),
+    ("rhel", "10"): ("2035-05-31", None, None),
+}
+
+
+def release_support_status(distro, release, today=None):
+    """Support lifecycle for a distro release, or None if unknown.
+
+    `today` is an ISO date string, defaulting to the current UTC date; passing
+    it explicitly keeps callers and tests deterministic.
+
+    Returns {phase, free_security_end, extended_end, extended_name}, where
+    phase is supported / extended / eol. `extended` means free support has
+    ended and only a commercial programme (ESM/ELTS/ELS) still ships fixes —
+    the host may or may not be enrolled, which is not visible from outside, so
+    it is reported as its own state rather than folded into either neighbour.
+    """
+    entry = RELEASE_SUPPORT.get((distro, release))
+    if not entry:
+        return None
+    free_end, extended_end, extended_name = entry
+    if today is None:
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).date().isoformat()
+
+    if today <= free_end:
+        phase = SUPPORT_SUPPORTED
+    elif extended_end and today <= extended_end:
+        phase = SUPPORT_EXTENDED
+    else:
+        phase = SUPPORT_EOL
+    return {
+        "phase": phase,
+        "free_security_end": free_end,
+        "extended_end": extended_end,
+        "extended_name": extended_name,
+    }
+
+
+# Patch-confidence states. External scanning can read a version string but not
+# a patch level, and those are different things: a distro backports security
+# fixes without moving the upstream version, so "OpenSSH 9.2p1" alone says
+# nothing about whether a given CVE is fixed. These three states record how
+# much the observed banner actually supports.
+#
+#   CONFIRMED  a package revision was observed (Debian/Ubuntu tag) or the
+#              el-family frozen-version path resolved a release. Backport
+#              evaluation applies and its verdict can be trusted.
+#   UNKNOWN    the host is evidently distro-managed but disclosed no patch
+#              level -- a stripped banner (DebianBanner no), or an OS tag with
+#              no revision. Version-range matching still produces CVEs, but
+#              they are POTENTIAL: undecidable from outside.
+#   UPSTREAM   the version is not attributable to any distro's stock package,
+#              so upstream range matching means what it says.
+PATCH_CONFIRMED = "confirmed"
+PATCH_LEVEL_UNKNOWN = "patch-level-unknown"
+PATCH_UPSTREAM = "upstream"
+
+
+def matches_distro_stock_version(version):
+    """Distro releases whose stock OpenSSH is exactly `version`.
+
+    Returns a list of (distro, codename); empty when the version belongs to no
+    known stock package. A bare "9.2p1" is Bookworm's stock OpenSSH, which
+    makes the host *probably* distro-managed -- evidence for lowering
+    confidence, never for asserting a patch level.
+    """
+    if not version:
+        return []
+    out = [("debian", c) for v, c in DEBIAN_OPENSSH_RELEASES.items() if v == version]
+    out += [("ubuntu", c) for v, c in UBUNTU_OPENSSH_RELEASES.items() if v == version]
+    return out
+
+
+def classify_patch_confidence(hint, version=None):
+    """Classify how far a service's patch level is externally knowable.
+
+    `hint` is a detect_distro_from_banner() result (or None); `version` is the
+    upstream version string. Returns one of the PATCH_* constants.
+    """
+    if hint:
+        # A package revision is the only direct evidence of a patch level.
+        if hint.get("package_revision"):
+            return PATCH_CONFIRMED
+        # el-family: the version is frozen per major and fixes ship as RPM
+        # release bumps, so a resolved release IS the patch context. This is
+        # the established Tier-1 path and is deliberately left confident.
+        if hint.get("distro") == "rhel" and hint.get("distro_release"):
+            return PATCH_CONFIRMED
+        # Distro-tagged but no revision, e.g. "Apache/2.4.57 (Debian)".
+        return PATCH_LEVEL_UNKNOWN
+
+    if matches_distro_stock_version(version):
+        return PATCH_LEVEL_UNKNOWN
+
+    return PATCH_UPSTREAM
 
 
 def get_osv_ecosystem(distro, distro_release):

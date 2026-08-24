@@ -74,6 +74,16 @@ def compare_version(v1, v2):
 
 _RE_MARIADB_COMPAT_PREFIX = re.compile(r"^5\.5\.5-(?=\d+\.\d+)")
 
+# nmap reports an open-ended bound when its fingerprint can narrow a product to
+# a range but not to a build: "2.0.0 or later" (HAProxy), "9.6.0 or later"
+# (PostgreSQL), "10.3.23 or earlier" (MariaDB). The leading number is the edge
+# of the range, not the installed version. Taking it literally pins the host to
+# that edge — for "or later" the OLDEST build it could possibly be — and scores
+# it for every CVE fixed since. Across the stored corpus every one of HAProxy's
+# 298 detections is such a bound, so its entire CVE count was an artefact of
+# reading "2.0.0 or later" as 2.0.0.
+_RE_OPEN_BOUND = re.compile(r"\bor\s+(?:later|earlier|newer|older)\b", re.IGNORECASE)
+
 
 def parse_version(version):
     """Parse a version string into a structured dict.
@@ -96,6 +106,12 @@ def parse_version(version):
     # Only stripped when a real version follows, so "5.5.5-log" and a genuine
     # 5.5.5 packaging revision ("5.5.5-1ubuntu0.1") are left untouched.
     version = _RE_MARIADB_COMPAT_PREFIX.sub("", version, count=1)
+
+    # An open-ended bound is not a version. Report it as absent so the caller
+    # falls back to its no-version handling rather than matching the edge.
+    if _RE_OPEN_BOUND.search(version):
+        return {"ver": "*", "vup": "*", "from_": None, "to_": None,
+                "empty": True, "range_": False}
 
     # Range patterns: "3.x - 4.x" or "3.3.x - 3.4.x"
     m = re.match(r"([^-]*)\s+-\s+([^-]*)", version)
