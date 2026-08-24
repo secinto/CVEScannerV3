@@ -649,6 +649,49 @@ UBUNTU_BACKOFF_BASE = 3.0
 UBUNTU_PAGE_PAUSE = 0.5
 
 
+def summarize_ubuntu_rows(package, releases, definitive, soft, cves_seen):
+    """Build the per-package log lines for the Ubuntu backfill.
+
+    Reports a release that produced nothing even when other releases did.
+    Ubuntu renames a source package whenever a release pins a major version —
+    mariadb on 24.04, mariadb-10.6 on 22.04, mariadb-10.3 on 20.04 — so a
+    package list carrying only the unversioned name is valid for one release
+    and silently empty for the rest. A whole-package check cannot see that:
+    the name is genuinely correct somewhere, so rows come back and nothing
+    looks wrong. That is how MariaDB shipped covering 24.04 alone.
+
+    Returns a list of lines; the caller prints them.
+    """
+    rows = list(definitive) + list(soft)
+    if not rows:
+        # A misspelled or wrongly-versioned source package name returns an
+        # empty result set, not an error — Ubuntu's source names are not the
+        # CPE product names (exim -> exim4, mysql -> mysql-8.0). Left quiet,
+        # that reads as "nothing to suppress", which is indistinguishable from
+        # "this package is clean".
+        return [f"[!] Ubuntu {package}: no rows — check the source "
+                f"package name ({cves_seen} CVEs returned)"]
+
+    # Row layout is (cve_id, distro, release, package, ...).
+    per_release = {}
+    for row in rows:
+        per_release[row[2]] = per_release.get(row[2], 0) + 1
+
+    breakdown = ", ".join(f"{rel}={per_release.get(rel, 0)}" for rel in releases)
+    lines = [f"[+] Ubuntu {package}: {len(definitive)} definitive + "
+             f"{len(soft)} other rows ({cves_seen} CVEs scanned; {breakdown})"]
+
+    empty = [rel for rel in releases if not per_release.get(rel)]
+    if empty:
+        lines.append(
+            f"[!] Ubuntu {package}: no rows for {', '.join(empty)} though other "
+            f"releases matched — if that release pins a major version it uses "
+            f"its own source name (mariadb-10.6 on 22.04); add it to the "
+            f"package list, and give it a per-release entry in "
+            f"cpe-to-package.json or the rows stay unreadable at scan time")
+    return lines
+
+
 def update_backports_ubuntu(db_path, releases=("24.04", "22.04", "20.04"),
                             packages=("openssh",), page_size=UBUNTU_PAGE_SIZE):
     """Backfill the backports table from Canonical's security tracker.
@@ -735,17 +778,9 @@ def update_backports_ubuntu(db_path, releases=("24.04", "22.04", "20.04"),
             db.cursor.executemany(cols.format("IGNORE"), soft)
             db.conn.commit()
             total += len(definitive) + len(soft)
-            if not definitive and not soft:
-                # A misspelled or wrongly-versioned source package name returns
-                # an empty result set, not an error — Ubuntu's source names are
-                # not the CPE product names (exim -> exim4, mysql -> mysql-8.0).
-                # Left quiet, that reads as "nothing to suppress", which is
-                # indistinguishable from "this package is clean".
-                print(f"[!] Ubuntu {package}: no rows — check the source "
-                      f"package name ({len(entries)} CVEs returned)")
-            else:
-                print(f"[+] Ubuntu {package}: {len(definitive)} definitive + "
-                      f"{len(soft)} other rows ({len(entries)} CVEs scanned)")
+            for line in summarize_ubuntu_rows(package, releases, definitive,
+                                              soft, len(entries)):
+                print(line)
 
         for rel in releases:
             db.cursor.execute(
