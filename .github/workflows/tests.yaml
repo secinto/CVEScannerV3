@@ -5,6 +5,12 @@ on:
     branches: [master]
   pull_request:
 
+# Least privilege: these jobs only read the repo. Declared explicitly rather
+# than relying on the repository default, which is write on the public repos
+# and could change without anyone revisiting this file.
+permissions:
+  contents: read
+
 concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
