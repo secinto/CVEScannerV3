@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "CVEScannerV3",
+  "project_id": "0ecba33f-8e8f-46db-aa04-9ced133e53d9"
+}
