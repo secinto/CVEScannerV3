@@ -24,6 +24,54 @@
       "citation": "https://access.redhat.com/security/cve/CVE-2023-51767",
       "added_by": "analyst",
       "date": "2026-06-17"
+    },
+    {
+      "cve": "CVE-2007-2768",
+      "distro": "AlmaLinux",
+      "release": "7",
+      "package": "openssh",
+      "disposition": "not_affected",
+      "fixed_version": null,
+      "reason": "OPIE/PAM is not part of the el package set, so the precondition of this CVE cannot be met. Red Hat's own verdict reads \"Not vulnerable. OPIE for PAM is not shipped with Red Hat Enterprise Linux 2.1, 3, 4, 5, 6, or 7\"; the enumeration stops at 7 only because the statement was written in 2007 - no opie/pam_opie package exists in any EL-family repository (RHEL, CentOS, AlmaLinux, Rocky, Oracle) or in EPEL for el8+, so the same reasoning carries forward to el8/el9/el10. Red Hat records this verdict ONLY in the free-text `statement` field: there is no `package_state` entry and no OVAL definition in either rhel-N.oval.xml or rhel-N-including-unpatched.oval.xml, so no structured feed can supply it and the auto-sourced backfill leaves it UNCERTAIN. NVD compounds this by carrying the record with no version bounds at all, so it matches every OpenSSH release ever published - the same structural defect already gated for CVE-2008-3844. Verified 2026-09-09.",
+      "citation": "https://access.redhat.com/security/cve/CVE-2007-2768",
+      "added_by": "analyst",
+      "date": "2026-09-09"
+    },
+    {
+      "cve": "CVE-2007-2768",
+      "distro": "AlmaLinux",
+      "release": "8",
+      "package": "openssh",
+      "disposition": "not_affected",
+      "fixed_version": null,
+      "reason": "OPIE/PAM is not part of the el package set, so the precondition of this CVE cannot be met. Red Hat's own verdict reads \"Not vulnerable. OPIE for PAM is not shipped with Red Hat Enterprise Linux 2.1, 3, 4, 5, 6, or 7\"; the enumeration stops at 7 only because the statement was written in 2007 - no opie/pam_opie package exists in any EL-family repository (RHEL, CentOS, AlmaLinux, Rocky, Oracle) or in EPEL for el8+, so the same reasoning carries forward to el8/el9/el10. Red Hat records this verdict ONLY in the free-text `statement` field: there is no `package_state` entry and no OVAL definition in either rhel-N.oval.xml or rhel-N-including-unpatched.oval.xml, so no structured feed can supply it and the auto-sourced backfill leaves it UNCERTAIN. NVD compounds this by carrying the record with no version bounds at all, so it matches every OpenSSH release ever published - the same structural defect already gated for CVE-2008-3844. Verified 2026-09-09.",
+      "citation": "https://access.redhat.com/security/cve/CVE-2007-2768",
+      "added_by": "analyst",
+      "date": "2026-09-09"
+    },
+    {
+      "cve": "CVE-2007-2768",
+      "distro": "AlmaLinux",
+      "release": "9",
+      "package": "openssh",
+      "disposition": "not_affected",
+      "fixed_version": null,
+      "reason": "OPIE/PAM is not part of the el package set, so the precondition of this CVE cannot be met. Red Hat's own verdict reads \"Not vulnerable. OPIE for PAM is not shipped with Red Hat Enterprise Linux 2.1, 3, 4, 5, 6, or 7\"; the enumeration stops at 7 only because the statement was written in 2007 - no opie/pam_opie package exists in any EL-family repository (RHEL, CentOS, AlmaLinux, Rocky, Oracle) or in EPEL for el8+, so the same reasoning carries forward to el8/el9/el10. Red Hat records this verdict ONLY in the free-text `statement` field: there is no `package_state` entry and no OVAL definition in either rhel-N.oval.xml or rhel-N-including-unpatched.oval.xml, so no structured feed can supply it and the auto-sourced backfill leaves it UNCERTAIN. NVD compounds this by carrying the record with no version bounds at all, so it matches every OpenSSH release ever published - the same structural defect already gated for CVE-2008-3844. Verified 2026-09-09.",
+      "citation": "https://access.redhat.com/security/cve/CVE-2007-2768",
+      "added_by": "analyst",
+      "date": "2026-09-09"
+    },
+    {
+      "cve": "CVE-2007-2768",
+      "distro": "AlmaLinux",
+      "release": "10",
+      "package": "openssh",
+      "disposition": "not_affected",
+      "fixed_version": null,
+      "reason": "OPIE/PAM is not part of the el package set, so the precondition of this CVE cannot be met. Red Hat's own verdict reads \"Not vulnerable. OPIE for PAM is not shipped with Red Hat Enterprise Linux 2.1, 3, 4, 5, 6, or 7\"; the enumeration stops at 7 only because the statement was written in 2007 - no opie/pam_opie package exists in any EL-family repository (RHEL, CentOS, AlmaLinux, Rocky, Oracle) or in EPEL for el8+, so the same reasoning carries forward to el8/el9/el10. Red Hat records this verdict ONLY in the free-text `statement` field: there is no `package_state` entry and no OVAL definition in either rhel-N.oval.xml or rhel-N-including-unpatched.oval.xml, so no structured feed can supply it and the auto-sourced backfill leaves it UNCERTAIN. NVD compounds this by carrying the record with no version bounds at all, so it matches every OpenSSH release ever published - the same structural defect already gated for CVE-2008-3844. Verified 2026-09-09.",
+      "citation": "https://access.redhat.com/security/cve/CVE-2007-2768",
+      "added_by": "analyst",
+      "date": "2026-09-09"
     }
   ]
 }
