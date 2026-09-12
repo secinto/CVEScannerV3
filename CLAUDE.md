@@ -127,3 +127,21 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 - Do not commit or push without clear authority from the active profile or the current user request.
 - If a required sync or push is blocked, stop and report the exact command and error.
 <!-- END BEADS INTEGRATION -->
+
+## Issue tracking (beads): bootstrap, never init
+
+`.beads/` is committed, but the issue data lives in the git ref `refs/dolt/data`,
+which a normal `git clone` does not fetch. The canonical database is maintained
+on **balrog**; every other checkout (app, test-two, build, phishy, bifrost, …)
+is a replica of the same Dolt history.
+
+- **New checkout, or `.beads/embeddeddolt` missing: run `bd bootstrap`.**
+  Never `bd init` here. A second init creates an unrelated Dolt history that can
+  never be pushed or pulled again ("no common ancestor"); that happened across
+  these repos in September 2026 and had to be repaired by hand.
+- Start of a session: `bd dolt pull`. Session close: `bd dolt push`.
+- If a push fails with "no common ancestor", do not force-push and do not
+  bootstrap over your data. Repair: `bd export > /tmp/mine.jsonl`, move
+  `.beads/embeddeddolt` aside, `bd bootstrap`, `bd import /tmp/mine.jsonl`,
+  then push.
+- `git ls-remote origin refs/dolt/data` shows whether a remote history exists.
