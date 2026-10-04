@@ -5,6 +5,7 @@
 """Distro detection from service banners and release mapping."""
 
 import re
+from typing import NamedTuple
 
 # Debian codename → (OSV ecosystem prefix, release number)
 DEBIAN_RELEASES = {
@@ -412,6 +413,42 @@ PATCH_CONFIRMED = "confirmed"
 PATCH_LEVEL_UNKNOWN = "patch-level-unknown"
 PATCH_UPSTREAM = "upstream"
 
+# Why a service is UNKNOWN. The reason is set only for that state (empty for
+# CONFIRMED and UPSTREAM) and tells the reader what they would have to check on
+# their own server. The reports carry one more value, "unknown", for scanner
+# output that predates these codes; this module never emits it.
+#
+#   DISTRO_TAG_NO_REVISION     the banner names a distribution but no package
+#                              revision ("Apache/2.4.57 (Debian)").
+#   STOCK_VERSION_BARE_BANNER  no distribution tag, but the bare version is the
+#                              stock package of one or more known releases
+#                              (OpenSSH 9.2p1 = Debian bookworm).
+#   EL_RELEASE_UNRESOLVED      Red Hat-compatible tag whose el release cannot
+#                              be determined.
+REASON_DISTRO_TAG_NO_REVISION = "distro_tag_no_revision"
+REASON_STOCK_VERSION_BARE_BANNER = "stock_version_bare_banner"
+REASON_EL_RELEASE_UNRESOLVED = "el_release_unresolved"
+
+
+class PatchAssessment(NamedTuple):
+    """Outcome of explain_patch_confidence().
+
+    confidence  one of the PATCH_* constants.
+    reason      one of the REASON_* codes when confidence is
+                PATCH_LEVEL_UNKNOWN, else "".
+    distro      the distribution the banner names ("debian", "ubuntu",
+                "rhel"), "" when it names none.
+    candidates  "distro:codename" strings (["debian:bookworm"]) whose stock
+                package equals the bare version; only for
+                REASON_STOCK_VERSION_BARE_BANNER, else []. A fresh list per
+                call.
+    """
+
+    confidence: str
+    reason: str
+    distro: str
+    candidates: list
+
 
 def matches_distro_stock_version(version):
     """Distro releases whose stock OpenSSH is exactly `version`.
@@ -428,28 +465,49 @@ def matches_distro_stock_version(version):
     return out
 
 
+def explain_patch_confidence(hint, version=None):
+    """Classify how far a service's patch level is externally knowable, and why.
+
+    `hint` is a detect_distro_from_banner() result (or None); `version` is the
+    upstream version string. Returns a PatchAssessment.
+    """
+    if hint:
+        distro = hint.get("distro") or ""
+        # A package revision is the only direct evidence of a patch level.
+        if hint.get("package_revision"):
+            return PatchAssessment(PATCH_CONFIRMED, "", distro, [])
+        if distro == "rhel":
+            # el-family: the version is frozen per major and fixes ship as RPM
+            # release bumps, so a resolved release IS the patch context. This
+            # is the established Tier-1 path and is deliberately left
+            # confident.
+            if hint.get("distro_release"):
+                return PatchAssessment(PATCH_CONFIRMED, "", distro, [])
+            return PatchAssessment(
+                PATCH_LEVEL_UNKNOWN, REASON_EL_RELEASE_UNRESOLVED, distro, [])
+        # Distro-tagged but no revision, e.g. "Apache/2.4.57 (Debian)".
+        return PatchAssessment(
+            PATCH_LEVEL_UNKNOWN, REASON_DISTRO_TAG_NO_REVISION, distro, [])
+
+    candidates = [
+        f"{distro}:{codename}"
+        for distro, codename in matches_distro_stock_version(version)
+    ]
+    if candidates:
+        return PatchAssessment(
+            PATCH_LEVEL_UNKNOWN, REASON_STOCK_VERSION_BARE_BANNER, "", candidates)
+
+    return PatchAssessment(PATCH_UPSTREAM, "", "", [])
+
+
 def classify_patch_confidence(hint, version=None):
     """Classify how far a service's patch level is externally knowable.
 
     `hint` is a detect_distro_from_banner() result (or None); `version` is the
-    upstream version string. Returns one of the PATCH_* constants.
+    upstream version string. Returns one of the PATCH_* constants; use
+    explain_patch_confidence() for the reason as well.
     """
-    if hint:
-        # A package revision is the only direct evidence of a patch level.
-        if hint.get("package_revision"):
-            return PATCH_CONFIRMED
-        # el-family: the version is frozen per major and fixes ship as RPM
-        # release bumps, so a resolved release IS the patch context. This is
-        # the established Tier-1 path and is deliberately left confident.
-        if hint.get("distro") == "rhel" and hint.get("distro_release"):
-            return PATCH_CONFIRMED
-        # Distro-tagged but no revision, e.g. "Apache/2.4.57 (Debian)".
-        return PATCH_LEVEL_UNKNOWN
-
-    if matches_distro_stock_version(version):
-        return PATCH_LEVEL_UNKNOWN
-
-    return PATCH_UPSTREAM
+    return explain_patch_confidence(hint, version).confidence
 
 
 def get_osv_ecosystem(distro, distro_release):
