@@ -1204,6 +1204,30 @@ class TestExplainPatchConfidence(unittest.TestCase):
             explain_patch_confidence(hint, "2.4.62"),
             PATCH_LEVEL_UNKNOWN, REASON_EL_RELEASE_UNRESOLVED, "rhel", [])
 
+    def test_rhel_revision_wins_over_a_missing_release(self):
+        # detect_distro_from_banner never gives a rhel hint a revision, so build
+        # one. The revision is the direct evidence and is checked first: with
+        # the rhel branch ahead of it this hint would read el_release_unresolved.
+        hint = {"distro": "rhel", "distro_release": None, "package_revision": "1.el9"}
+        self.assertAssessment(
+            explain_patch_confidence(hint, "9.9"),
+            PATCH_CONFIRMED, "", "rhel", [])
+
+    def test_hint_without_a_distro_name_reports_an_empty_string(self):
+        # distro is a str in every result, never None.
+        for hint, confidence, reason in (
+            ({"distro": None, "distro_release": None, "package_revision": None},
+             PATCH_LEVEL_UNKNOWN, REASON_DISTRO_TAG_NO_REVISION),
+            ({"distro_release": None, "package_revision": None},
+             PATCH_LEVEL_UNKNOWN, REASON_DISTRO_TAG_NO_REVISION),
+            ({"distro": None, "package_revision": "2+deb12u7"},
+             PATCH_CONFIRMED, ""),
+        ):
+            with self.subTest(hint=hint):
+                result = explain_patch_confidence(hint, "9.2p1")
+                self.assertIsInstance(result.distro, str)
+                self.assertAssessment(result, confidence, reason, "", [])
+
     def test_debian_tag_without_revision(self):
         hint = detect_distro_from_banner("Apache/2.4.57 (Debian)")
         self.assertAssessment(
@@ -1301,6 +1325,7 @@ class TestExplainPatchConfidence(unittest.TestCase):
             detect_distro_from_banner("Apache/2.4.52 (Ubuntu)"),
             {"distro": None, "distro_release": None, "package_revision": None},
             {"distro": "rhel", "distro_release": "9", "package_revision": None},
+            {"distro": "rhel", "distro_release": None, "package_revision": "1.el9"},
         ]
         versions = [None, "", "2.4.57", "8.0", "9.2p1", "9.4p1", "9.6p1", "10.0p2"]
         for hint in hints:
