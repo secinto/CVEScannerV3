@@ -485,8 +485,10 @@ When backport detection is active, CVEs are split into `cves` (active) and
 **Patch confidence** — a version string says little about the patch level on a
 distribution-managed host. `extra/distro.py` rates each service from its banner:
 `explain_patch_confidence(hint, version)` returns the confidence (`confirmed`,
-`patch-level-unknown` or `upstream`) and, for `patch-level-unknown`, the reason
-and the distribution data behind it. `classify_patch_confidence()` returns the
+`patch-level-unknown` or `upstream`), the reason when it is
+`patch-level-unknown`, the distribution the banner names (for any service whose
+banner names one) and, for a stripped banner on a stock version, the
+`distro:codename` candidates. `classify_patch_confidence()` returns the
 confidence alone.
 
 | Reason | Set when |
