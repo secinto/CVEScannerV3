@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest import mock
 
 # Ensure extra/ is on the path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -35,14 +36,20 @@ from cvescan import (
     scan_service,
     VERSION,
 )
+import distro as distro_module
 from distro import (
     PATCH_CONFIRMED,
     PATCH_LEVEL_UNKNOWN,
     PATCH_UPSTREAM,
+    REASON_DISTRO_TAG_NO_REVISION,
+    REASON_EL_RELEASE_UNRESOLVED,
+    REASON_STOCK_VERSION_BARE_BANNER,
     SUPPORT_EOL,
     SUPPORT_EXTENDED,
     SUPPORT_SUPPORTED,
+    PatchAssessment,
     classify_patch_confidence,
+    explain_patch_confidence,
     release_support_status,
     detect_debian_release,
     detect_distro_from_banner,
@@ -1138,6 +1145,173 @@ class TestPatchConfidence(unittest.TestCase):
                          [("ubuntu", "noble")])
         self.assertEqual(matches_distro_stock_version("9.4p1"), [])
         self.assertEqual(matches_distro_stock_version(""), [])
+
+
+def _legacy_classify_patch_confidence(hint, version=None):
+    """classify_patch_confidence as it was before explain_patch_confidence.
+
+    Kept verbatim so the wrapper test compares against the old behaviour, not
+    against a restatement of the new code.
+    """
+    if hint:
+        if hint.get("package_revision"):
+            return PATCH_CONFIRMED
+        if hint.get("distro") == "rhel" and hint.get("distro_release"):
+            return PATCH_CONFIRMED
+        return PATCH_LEVEL_UNKNOWN
+
+    if matches_distro_stock_version(version):
+        return PATCH_LEVEL_UNKNOWN
+
+    return PATCH_UPSTREAM
+
+
+class TestExplainPatchConfidence(unittest.TestCase):
+    """Why a service's patch level is, or is not, externally knowable."""
+
+    def assertAssessment(self, result, confidence, reason, distro, candidates):
+        self.assertEqual(
+            result, PatchAssessment(confidence, reason, distro, candidates))
+
+    def test_debian_revision_is_confirmed(self):
+        hint = detect_distro_from_banner("OpenSSH_9.2p1 Debian-2+deb12u7")
+        self.assertAssessment(
+            explain_patch_confidence(hint, "9.2p1"),
+            PATCH_CONFIRMED, "", "debian", [])
+
+    def test_ubuntu_revision_is_confirmed(self):
+        hint = detect_distro_from_banner("OpenSSH_9.6p1 Ubuntu 3ubuntu13.16")
+        self.assertAssessment(
+            explain_patch_confidence(hint, "9.6p1"),
+            PATCH_CONFIRMED, "", "ubuntu", [])
+
+    def test_rhel_with_release_is_confirmed(self):
+        hint = detect_distro_from_banner("OpenSSH_8.0")
+        self.assertAssessment(
+            explain_patch_confidence(hint, "8.0"),
+            PATCH_CONFIRMED, "", "rhel", [])
+        # The Apache tag path resolves el8 from the frozen 2.4.37.
+        hint = detect_distro_from_banner("Apache/2.4.37 (Red Hat Enterprise Linux)")
+        self.assertAssessment(
+            explain_patch_confidence(hint, "2.4.37"),
+            PATCH_CONFIRMED, "", "rhel", [])
+
+    def test_rhel_without_release_is_el_release_unresolved(self):
+        # httpd 2.4.62 shipped in more than one el major, so it pins none.
+        hint = detect_distro_from_banner("Apache/2.4.62 (Red Hat Enterprise Linux)")
+        self.assertIsNone(hint["distro_release"])
+        self.assertAssessment(
+            explain_patch_confidence(hint, "2.4.62"),
+            PATCH_LEVEL_UNKNOWN, REASON_EL_RELEASE_UNRESOLVED, "rhel", [])
+
+    def test_debian_tag_without_revision(self):
+        hint = detect_distro_from_banner("Apache/2.4.57 (Debian)")
+        self.assertAssessment(
+            explain_patch_confidence(hint, "2.4.57"),
+            PATCH_LEVEL_UNKNOWN, REASON_DISTRO_TAG_NO_REVISION, "debian", [])
+
+    def test_ubuntu_tag_without_revision(self):
+        hint = detect_distro_from_banner("Apache/2.4.52 (Ubuntu)")
+        self.assertAssessment(
+            explain_patch_confidence(hint, "2.4.52"),
+            PATCH_LEVEL_UNKNOWN, REASON_DISTRO_TAG_NO_REVISION, "ubuntu", [])
+
+    def test_tag_wins_over_a_stock_version_match(self):
+        # The hint branch is decided before the stock-version table is read, so
+        # a tagged banner never carries candidates.
+        hint = detect_distro_from_banner("Apache/2.4.57 (Debian)")
+        self.assertAssessment(
+            explain_patch_confidence(hint, "9.2p1"),
+            PATCH_LEVEL_UNKNOWN, REASON_DISTRO_TAG_NO_REVISION, "debian", [])
+
+    def test_bare_banner_on_debian_stock_version(self):
+        # DebianBanner no: bookworm's 9.2p1 and trixie's 10.0p2.
+        self.assertAssessment(
+            explain_patch_confidence(None, "9.2p1"),
+            PATCH_LEVEL_UNKNOWN, REASON_STOCK_VERSION_BARE_BANNER, "",
+            ["debian:bookworm"])
+        self.assertAssessment(
+            explain_patch_confidence(None, "10.0p2"),
+            PATCH_LEVEL_UNKNOWN, REASON_STOCK_VERSION_BARE_BANNER, "",
+            ["debian:trixie"])
+
+    def test_bare_banner_on_ubuntu_stock_version(self):
+        self.assertAssessment(
+            explain_patch_confidence(None, "9.6p1"),
+            PATCH_LEVEL_UNKNOWN, REASON_STOCK_VERSION_BARE_BANNER, "",
+            ["ubuntu:noble"])
+
+    def test_candidates_list_every_matching_release(self):
+        # No version is stock in both families today; force one to pin the
+        # "distro:codename" format and the debian-before-ubuntu order.
+        with mock.patch.dict(
+                distro_module.UBUNTU_OPENSSH_RELEASES, {"9.2p1": "jammy"}):
+            result = explain_patch_confidence(None, "9.2p1")
+        self.assertEqual(result.candidates, ["debian:bookworm", "ubuntu:jammy"])
+
+    def test_non_stock_version_is_upstream(self):
+        self.assertAssessment(
+            explain_patch_confidence(None, "9.4p1"),
+            PATCH_UPSTREAM, "", "", [])
+
+    def test_no_version_is_upstream(self):
+        self.assertAssessment(
+            explain_patch_confidence(None, None), PATCH_UPSTREAM, "", "", [])
+        self.assertAssessment(
+            explain_patch_confidence(None), PATCH_UPSTREAM, "", "", [])
+
+    def test_reason_is_set_only_when_the_patch_level_is_unknown(self):
+        cases = [
+            (detect_distro_from_banner("OpenSSH_9.2p1 Debian-2+deb12u7"), "9.2p1"),
+            (detect_distro_from_banner("OpenSSH_8.0"), "8.0"),
+            (detect_distro_from_banner("Apache/2.4.62 (CentOS)"), "2.4.62"),
+            (detect_distro_from_banner("Apache/2.4.57 (Debian)"), "2.4.57"),
+            (None, "9.2p1"),
+            (None, "9.4p1"),
+            (None, None),
+        ]
+        for hint, version in cases:
+            with self.subTest(hint=hint, version=version):
+                result = explain_patch_confidence(hint, version)
+                self.assertEqual(
+                    bool(result.reason), result.confidence == PATCH_LEVEL_UNKNOWN)
+                self.assertEqual(
+                    bool(result.candidates),
+                    result.reason == REASON_STOCK_VERSION_BARE_BANNER)
+
+    def test_result_is_immutable_and_candidates_are_per_call(self):
+        result = explain_patch_confidence(None, "9.2p1")
+        with self.assertRaises(AttributeError):
+            result.confidence = PATCH_CONFIRMED
+        result.candidates.append("debian:sid")
+        self.assertEqual(
+            explain_patch_confidence(None, "9.2p1").candidates,
+            ["debian:bookworm"])
+
+    def test_classify_equals_the_old_behaviour(self):
+        hints = [
+            None,
+            {},
+            detect_distro_from_banner("OpenSSH_9.2p1 Debian-2+deb12u7"),
+            detect_distro_from_banner("OpenSSH_9.6p1 Ubuntu 3ubuntu13.16"),
+            detect_distro_from_banner("OpenSSH_8.0"),
+            detect_distro_from_banner("Apache/2.4.37 (Red Hat Enterprise Linux)"),
+            detect_distro_from_banner("Apache/2.4.62 (Red Hat Enterprise Linux)"),
+            detect_distro_from_banner("Apache/2.4.57 (Debian)"),
+            detect_distro_from_banner("Apache/2.4.52 (Ubuntu)"),
+            {"distro": None, "distro_release": None, "package_revision": None},
+            {"distro": "rhel", "distro_release": "9", "package_revision": None},
+        ]
+        versions = [None, "", "2.4.57", "8.0", "9.2p1", "9.4p1", "9.6p1", "10.0p2"]
+        for hint in hints:
+            for version in versions:
+                with self.subTest(hint=hint, version=version):
+                    self.assertEqual(
+                        classify_patch_confidence(hint, version),
+                        _legacy_classify_patch_confidence(hint, version))
+                    self.assertEqual(
+                        classify_patch_confidence(hint, version),
+                        explain_patch_confidence(hint, version).confidence)
 
 
 class TestDebianRelease(unittest.TestCase):
