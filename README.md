@@ -482,6 +482,21 @@ python extra/cvescan.py scan -p openssh -v 8.4 --distro debian --distro-release 
 When backport detection is active, CVEs are split into `cves` (active) and
 `likely_patched` in the JSON output.
 
+**Patch confidence** — a version string says little about the patch level on a
+distribution-managed host. `extra/distro.py` rates each service from its banner:
+`explain_patch_confidence(hint, version)` returns the confidence (`confirmed`,
+`patch-level-unknown` or `upstream`), the reason when it is
+`patch-level-unknown`, the distribution the banner names (for any service whose
+banner names one) and, for a stripped banner on a stock version, the
+`distro:codename` candidates. `classify_patch_confidence()` returns the
+confidence alone.
+
+| Reason | Set when |
+|---|---|
+| `distro_tag_no_revision` | the banner names a distribution but no package revision, e.g. `Apache/2.4.57 (Debian)` |
+| `stock_version_bare_banner` | the banner is stripped and its bare version is the stock package of known releases, e.g. OpenSSH `9.2p1` (Debian bookworm); the matches are listed as `distro:codename` candidates |
+| `el_release_unresolved` | a Red Hat-compatible tag whose el release cannot be determined |
+
 **Supported data files:**
 - `extra/cpe-to-package.json` — maps CPE vendor:product to distro package names
 
