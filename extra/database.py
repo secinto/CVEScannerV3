@@ -977,6 +977,57 @@ def parse_node(node):
     ]
 
 
+def _is_open_ended(version, tags):
+    """A wildcard version with no range: it matches every version."""
+    return version == "*" and all(t is None for t in tags)
+
+
+def applicable_cpes(configurations):
+    """Yield ((vendor, product, version, update), tags) for every application
+    CPE that a CVE's NVD configurations mark as vulnerable.
+
+    Storing every CPE of a configuration, as this importer used to, turns
+    context into findings. Skipped:
+
+    - "vulnerable": false. NVD lists the platform a vulnerable add-on runs
+      on this way (CVE-2011-2688: mod_authnz_external on
+      apache:http_server:*), not a flaw in that platform.
+    - nodes with "negate": true. They name what must be absent.
+    - an open-ended CPE in an AND configuration. It is vulnerable only
+      together with a platform a remote scan cannot see (CVE-2008-3844:
+      OpenSSH AND RHEL 4/5), and its open end matches every version.
+    - an open-ended CPE when the same node names a concrete version of the
+      same product. That wildcard is noise (CVE-2004-0399 lists exim:* next
+      to exim:3.35 for a flaw in Exim 3.x only).
+
+    A bounded CPE in an AND configuration is kept: its range still limits
+    the match, and dropping it would lose "on Windows"-style findings.
+    """
+    for config in configurations:
+        in_and = config.get("operator") == "AND"
+        for node in config.get("nodes", []):
+            if node.get("negate"):
+                continue
+            matches = [
+                (cpe, split(cpe["criteria"]),
+                 [_norm(cpe[vt]) if vt in cpe else None for vt in VTAGS])
+                for cpe in node["cpeMatch"]
+            ]
+            concrete = {
+                (ven, pro)
+                for _, (_, ven, pro, ver, _), _ in matches
+                if ver not in ("*", "-")
+            }
+            for cpe, (ptype, ven, pro, ver, vup), tags in matches:
+                if ptype != "a" or not cpe.get("vulnerable", True):
+                    continue
+                if _is_open_ended(ver, tags) and (
+                    in_and or (ven, pro) in concrete
+                ):
+                    continue
+                yield (ven, pro, ver, vup), tags
+
+
 class PopulateDBThread(Thread):
     def __init__(self, path, finished, insert, queue):
         Thread.__init__(self)
@@ -1120,39 +1171,21 @@ def query_api(args):
                 )
                 year = int(vuln["cve"]["published"][:4])
                 queue.put((1, (cve_id, cvssv2, cvssv3, year)))
-                if "configurations" in vuln["cve"]:
-                    for config in vuln["cve"]["configurations"]:
-                        for node in config["nodes"]:
-                            products = parse_node(node)
-                            for (
-                                ptype,
-                                ven,
-                                pro,
-                                ver,
-                                vup,
-                            ), tags in products:
-                                if ptype == "a":
-                                    queue.put((0, (ven, pro, ver, vup)))
-                                    if (
-                                        all(t is None for t in tags)
-                                        and ver != "*"
-                                    ):
-                                        queue.put(
-                                            (
-                                                5,
-                                                (
-                                                    cve_id,
-                                                    ven,
-                                                    pro,
-                                                    ver,
-                                                    vup,
-                                                ),
-                                            )
-                                        )
-                                    else:
-                                        queue.put(
-                                            (6, (cve_id, ven, pro, *tags))
-                                        )
+                configurations = vuln["cve"].get("configurations", [])
+                # Every application CPE stays in the product dictionary;
+                # only the ones applicable_cpes keeps become findings.
+                for config in configurations:
+                    for node in config["nodes"]:
+                        for (ptype, ven, pro, ver, vup), _ in parse_node(node):
+                            if ptype == "a":
+                                queue.put((0, (ven, pro, ver, vup)))
+                for (ven, pro, ver, vup), tags in applicable_cpes(
+                    configurations
+                ):
+                    if all(t is None for t in tags) and ver != "*":
+                        queue.put((5, (cve_id, ven, pro, ver, vup)))
+                    else:
+                        queue.put((6, (cve_id, ven, pro, *tags)))
                 if "references" in vuln["cve"]:
                     for reference in vuln["cve"]["references"]:
                         if "exploit-db" in reference["url"] and (
