@@ -332,6 +332,14 @@ QUERY_AFFECTED = """
     WHERE products.product = ?
 """
 
+QUERY_SKIPPED = """
+    SELECT cve_id, version, version_update,
+           versionStartIncluding, versionStartExcluding,
+           versionEndIncluding, versionEndExcluding, reason
+    FROM skipped_affected
+    WHERE product = ?
+"""
+
 QUERY_EXPLOIT_INFO = """
     SELECT exploits.exploit_id, exploits.name
     FROM referenced_exploit
@@ -409,20 +417,60 @@ def get_all_exploit_info(cur, cve_ids):
     return exploits_by_cve, metasploits_by_cve
 
 
+def _target_versions(version_info):
+    """(from, to, update) to match rows against: the version itself, or the
+    edges of a range with its x placeholders widened."""
+    from_v = version_info["ver"]
+    to_v = version_info["ver"]
+    if not version_info["empty"] and version_info["range_"]:
+        from_v = version_info["from_"].replace("x", "0").replace("X", "0")
+        to_v = version_info["to_"].replace("x", "9999999999").replace("X", "9999999999")
+    return from_v, to_v, version_info["vup"]
+
+
+def find_skipped(cur, product, version_info):
+    """CVEs the database importer left out for product (skipped_affected)
+    that this version would have matched, as {cve_id: reason}.
+
+    Never findings: the importer left them out because NVD does not mark the
+    product vulnerable on its own (see database.classify_cpes). Reported so
+    that a scan can log what it no longer shows. Empty for an unknown version
+    and for a database built before the table existed.
+    """
+    if version_info["empty"]:
+        return {}
+    try:
+        cur.execute(QUERY_SKIPPED, [product])
+    except sql.OperationalError:
+        return {}
+    from_v, to_v, upd = _target_versions(version_info)
+    exact, ranged = [], []
+    for cve_id, ver, vup, st_in, st_ex, en_in, en_ex, reason in cur.fetchall():
+        # Keyed by (cve, reason): one CVE can be skipped for two reasons.
+        row = {"id": (cve_id, reason), "cvss_v2": None, "cvss_v3": None,
+               "exploitdb": 0, "metasploit": 0}
+        bounds = [b or None for b in (st_in, st_ex, en_in, en_ex)]
+        if ver != "*" and all(b is None for b in bounds):
+            exact.append({**row, "version": ver, "version_update": vup})
+        else:
+            ranged.append({**row, "start_inc": bounds[0], "start_exc": bounds[1],
+                           "end_inc": bounds[2], "end_exc": bounds[3]})
+    hits = {}
+    match_range_versions(ranged, from_v, to_v, hits)
+    match_exact_versions(exact, from_v, to_v, upd, hits)
+    skipped = {}
+    for cve_id, reason in sorted(hits):
+        skipped.setdefault(cve_id, reason)
+    return skipped
+
+
 def find_vulnerabilities(cur, product, version_info):
     """Main CVE lookup for a single product/version.
     Mirrors Lua vulnerabilities() — queries both affected and multiaffected tables.
 
     Returns dict {cve_id: {cvss_v2, cvss_v3, exploitdb, metasploit}}.
     """
-    from_v = version_info["ver"]
-    to_v = version_info["ver"]
-    upd = version_info["vup"]
-
-    if not version_info["empty"]:
-        if version_info["range_"]:
-            from_v = version_info["from_"].replace("x", "0").replace("X", "0")
-            to_v = version_info["to_"].replace("x", "9999999999").replace("X", "9999999999")
+    from_v, to_v, upd = _target_versions(version_info)
     vulns = {}
 
     if version_info["empty"]:
@@ -881,6 +929,15 @@ def scan_service(cur, service, aliases, maxcve, cache=None,
             else:
                 all_vulns[cve_id] = dict(info)
 
+    # What the importer left out but this version would have matched: logged
+    # by the caller, never reported. A CVE matched through another row is a
+    # finding, so it is not listed here.
+    skipped = {}
+    for prod_name in all_products:
+        for cve_id, reason in find_skipped(cur, prod_name, version_info).items():
+            if cve_id not in all_vulns:
+                skipped.setdefault(cve_id, reason)
+
     # Sort by CVSS score
     sorted_cves = rank_cves(all_vulns)
 
@@ -1001,6 +1058,11 @@ def scan_service(cur, service, aliases, maxcve, cache=None,
         result["ssh_crypto"] = crypto
     if patched_cves:
         result["likely_patched"] = patched_cves
+    if skipped:
+        result["skipped_cves"] = [
+            {"cve_id": cve_id, "reason": reason}
+            for cve_id, reason in sorted(skipped.items())
+        ]
     if "id" in service:
         result["id"] = service["id"]
     if "cpe" in service:

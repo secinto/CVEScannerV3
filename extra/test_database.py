@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from database import applicable_cpes, summarize_ubuntu_rows  # noqa: E402
+from database import applicable_cpes, classify_cpes, summarize_ubuntu_rows  # noqa: E402
 
 RELEASES = ("24.04", "22.04", "20.04")
 
@@ -154,6 +154,35 @@ class TestApplicableCpes(unittest.TestCase):
             _match("cpe:2.3:o:debian:debian_linux:12.0:*:*:*:*:*:*:*")]}]}]
         self.assertEqual(_kept(configs), [])
 
+
+
+class TestClassifyCpesReasons(unittest.TestCase):
+    """Every left-out CPE carries the reason it was left out, for the log."""
+
+    def _reasons(self, configurations):
+        return [(cpe[1], skip) for cpe, _, skip in classify_cpes(configurations)]
+
+    def test_each_skip_names_its_reason(self):
+        configs = [
+            {"nodes": [{"operator": "OR", "negate": False, "cpeMatch": [
+                _match("cpe:2.3:a:university_of_cambridge:exim:*:*:*:*:*:*:*:*"),
+                _match("cpe:2.3:a:university_of_cambridge:exim:3.35:*:*:*:*:*:*:*")]}]},
+            {"operator": "AND", "nodes": [
+                {"operator": "OR", "negate": False, "cpeMatch": [_match(
+                    "cpe:2.3:a:openbsd:openssh:*:*:*:*:*:*:*:*")]},
+                {"operator": "OR", "negate": False, "cpeMatch": [_match(
+                    "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*", vulnerable=False)]},
+                {"operator": "OR", "negate": True, "cpeMatch": [_match(
+                    "cpe:2.3:a:vendor:plugin:2.0:*:*:*:*:*:*:*")]},
+            ]},
+        ]
+        self.assertEqual(self._reasons(configs), [
+            ("exim", "wildcard_beside_concrete_version"),
+            ("exim", None),
+            ("openssh", "open_range_in_and_config"),
+            ("http_server", "not_vulnerable"),
+            ("plugin", "negated"),
+        ])
 
 if __name__ == "__main__":
     unittest.main()

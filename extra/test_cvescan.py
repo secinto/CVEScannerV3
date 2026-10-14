@@ -3,6 +3,7 @@
 """Tests for cvescan.py — Standalone CVE detection/association engine."""
 
 import json
+import os
 import sqlite3 as sql
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent))
 
 from cvescan import (
+    find_skipped,
     _detect_distro,
     _load_cpe_to_pkg,
     annotate_confidence,
@@ -731,6 +733,66 @@ class TestOpenRange(unittest.TestCase):
             self.assertIs(by_id["CVE-2023-2222"].get("open_range"), True)
         finally:
             self.conn.rollback()
+
+
+class TestSkipped(unittest.TestCase):
+    """Rows the importer left out are listed, never matched as findings."""
+
+    def setUp(self):
+        import tempfile
+        from database import Database, SKIP_NOT_VULNERABLE, SKIP_WILDCARD_BESIDE_VERSION
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        with Database(self.tmp.name) as db:
+            db.setup()
+            row = ("CVE-2004-0399", "university_of_cambridge", "exim", "*", "*",
+                   "", "", "", "", SKIP_WILDCARD_BESIDE_VERSION)
+            # Twice: an incremental update must not duplicate the row.
+            db.insert_skipped([row, row])
+            db.insert_skipped([
+                ("CVE-2011-2688", "apache", "http_server", "*", "*",
+                 "", "", "2.2.99", "", SKIP_NOT_VULNERABLE),
+                ("CVE-2099-0001", "apache", "http_server", "2.4.57", "*",
+                 "", "", "", "", SKIP_NOT_VULNERABLE),
+            ])
+        self.conn = sql.connect(self.tmp.name)
+        self.cur = self.conn.cursor()
+
+    def tearDown(self):
+        self.conn.close()
+        os.unlink(self.tmp.name)
+
+    def test_unique_rows(self):
+        self.cur.execute("SELECT COUNT(*) FROM skipped_affected WHERE cve_id='CVE-2004-0399'")
+        self.assertEqual(self.cur.fetchone()[0], 1)
+
+    def test_open_row_matches_any_version(self):
+        self.assertEqual(find_skipped(self.cur, "exim", parse_version("4.100.1")),
+                         {"CVE-2004-0399": "wildcard_beside_concrete_version"})
+
+    def test_bounds_and_exact_versions_still_apply(self):
+        self.assertEqual(find_skipped(self.cur, "http_server", parse_version("2.4.57")),
+                         {"CVE-2099-0001": "not_vulnerable"})
+        self.assertEqual(find_skipped(self.cur, "http_server", parse_version("2.2.15")),
+                         {"CVE-2011-2688": "not_vulnerable"})
+
+    def test_unknown_version_lists_nothing(self):
+        self.assertEqual(find_skipped(self.cur, "exim", parse_version(None)), {})
+
+    def test_database_without_the_table_lists_nothing(self):
+        conn = create_test_db()
+        try:
+            self.assertEqual(find_skipped(conn.cursor(), "exim", parse_version("4.100.1")), {})
+        finally:
+            conn.close()
+
+    def test_scan_service_reports_skipped_but_not_as_cves(self):
+        result = scan_service(self.cur, {"product": "exim", "version": "4.100.1"},
+                              aliases=None, maxcve=0)
+        self.assertEqual(result["cves"], [])
+        self.assertEqual(result["total_cves"], 0)
+        self.assertEqual(result["skipped_cves"], [
+            {"cve_id": "CVE-2004-0399", "reason": "wildcard_beside_concrete_version"}])
 
 
 class TestGetExploitInfo(unittest.TestCase):
