@@ -176,14 +176,29 @@ def _default_version(version, default):
     return version
 
 
-def _add_cve_result(v, result):
-    """Insert a CVE candidate into the result dict if not already present."""
+def _add_cve_result(v, result, open_range=False):
+    """Insert a CVE candidate into the result dict if not already present.
+
+    open_range: the candidate is a range row with no bounds at all, so it
+    matched without looking at the version. The flag survives only while
+    every row that matched the CVE is like that; one bounded or exact row
+    settles it.
+    """
     if v["id"] not in result:
         result[v["id"]] = {
             "cvss_v2": v["cvss_v2"], "cvss_v3": v["cvss_v3"],
             "exploitdb": v["exploitdb"],
             "metasploit": v["metasploit"],
+            "open_range": open_range,
         }
+    elif not open_range:
+        result[v["id"]]["open_range"] = False
+
+
+def _is_open_range(v):
+    """A range candidate with no bounds: NVD gave no version range."""
+    return all(v[k] is None
+               for k in ("start_inc", "start_exc", "end_inc", "end_exc"))
 
 
 def match_exact_versions(candidates, from_v, to_v, upd, result):
@@ -227,6 +242,7 @@ def match_range_versions(candidates, from_v, to_v, result):
     is_range_search = "." in from_v and ".9999999999" in to_v
 
     for v in candidates:
+        open_range = _is_open_range(v)
         st_in = _default_version(v["start_inc"], "0")
         st_ex = _default_version(v["start_exc"], "0")
         en_in = _default_version(v["end_inc"], "9999999999")
@@ -237,13 +253,13 @@ def match_range_versions(candidates, from_v, to_v, result):
                  or compare_version(st_ex, from_v) > 0)
                 and (compare_version(en_in, to_v) <= 0
                      or compare_version(en_ex, to_v) < 0)):
-                _add_cve_result(v, result)
+                _add_cve_result(v, result, open_range)
         else:
             if (compare_version(from_v, st_in) >= 0
                 and compare_version(from_v, st_ex) > 0
                 and compare_version(to_v, en_in) <= 0
                     and compare_version(to_v, en_ex) < 0):
-                _add_cve_result(v, result)
+                _add_cve_result(v, result, open_range)
 
 
 def rank_cves(cves):
@@ -419,6 +435,7 @@ def find_vulnerabilities(cur, product, version_info):
                 vulns[cve_id] = {
                     "cvss_v2": cvss_v2, "cvss_v3": cvss_v3,
                     "exploitdb": edb, "metasploit": msf,
+                    "open_range": True,
                 }
     else:
         # Query multiaffected (version ranges)
@@ -849,11 +866,20 @@ def scan_service(cur, service, aliases, maxcve, cache=None,
     for prod_name in all_products:
         cache_key = f"{prod_name}|{ver_display}|{vup_display}"
         if cache_key in cache:
-            all_vulns.update(cache[cache_key])
-            continue
-        prod_vulns = find_vulnerabilities(cur, prod_name, version_info)
-        cache[cache_key] = prod_vulns
-        all_vulns.update(prod_vulns)
+            prod_vulns = cache[cache_key]
+        else:
+            prod_vulns = find_vulnerabilities(cur, prod_name, version_info)
+            cache[cache_key] = prod_vulns
+        # Merge per CVE rather than dict.update: an alias that matched only
+        # through an open range must not hide a bounded match from another.
+        # Copies, because the cache shares these dicts across services.
+        for cve_id, info in prod_vulns.items():
+            if cve_id in all_vulns:
+                all_vulns[cve_id]["open_range"] = (
+                    all_vulns[cve_id].get("open_range", False)
+                    and info.get("open_range", False))
+            else:
+                all_vulns[cve_id] = dict(info)
 
     # Sort by CVSS score
     sorted_cves = rank_cves(all_vulns)
@@ -873,6 +899,10 @@ def scan_service(cur, service, aliases, maxcve, cache=None,
             "cvss_v2": _to_float(info["cvss_v2"]),
             "cvss_v3": _to_float(info["cvss_v3"]),
         }
+        if info.get("open_range"):
+            # NVD gave no version range: the match says nothing about the
+            # version that is running. Consumers report it as potential.
+            cve_entry["open_range"] = True
         if cve_id in exploits_by_cve:
             cve_entry["exploitdb"] = exploits_by_cve[cve_id]
         if cve_id in metasploits_by_cve:
