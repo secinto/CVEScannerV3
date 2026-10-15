@@ -17,7 +17,13 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent))
 
 from cvescan import (
+    COARSE_MAJOR_ONLY,
+    COARSE_RANGE,
+    coarse_version,
     find_skipped,
+    is_date_stamp,
+    _get_cpe_vendor_product,
+    _load_foreign_vendors,
     _detect_distro,
     _load_cpe_to_pkg,
     annotate_confidence,
@@ -2433,6 +2439,215 @@ class TestCLIDistro(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Backports:", result.stdout)
         self.assertIn("Debian:12", result.stdout)
+
+
+# ---------------------------------------------------------------------------
+# Tests: other vendors' products, coarse versions, date stamps
+# ---------------------------------------------------------------------------
+
+class TestForeignVendors(unittest.TestCase):
+    """Rows of another vendor's product with the same name do not match."""
+
+    FOREIGN = {"http_server": {"akka": "Akka HTTP"}}
+
+    def setUp(self):
+        self.conn = create_test_db()
+        self.cur = self.conn.cursor()
+        for vendor in ("apache", "akka"):
+            self.cur.execute(
+                "INSERT INTO products (vendor, product, version, version_update) "
+                "VALUES (?, 'http_server', '*', '*')", [vendor])
+        # akka:http_server <= 10.0.5 (CVE-2017-1000118): 2.4.62 is "below" it.
+        self.cur.execute(
+            "INSERT INTO multiaffected VALUES ('CVE-2023-1111', (SELECT product_id "
+            "FROM products WHERE vendor='akka' AND product='http_server'), "
+            "NULL, NULL, '10.0.5', NULL)")
+        self.cur.execute(
+            "INSERT INTO multiaffected VALUES ('CVE-2024-0001', (SELECT product_id "
+            "FROM products WHERE vendor='apache' AND product='http_server'), "
+            "'2.4.0', NULL, NULL, '2.4.63')")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def scan(self, service, cache=None):
+        result = scan_service(self.cur, service, aliases=None, maxcve=0,
+                              cache=cache, foreign_vendors=self.FOREIGN)
+        return ({c["cve_id"] for c in result["cves"]},
+                {s["cve_id"]: s["reason"] for s in result.get("skipped_cves", [])})
+
+    def test_other_vendors_row_is_logged_not_matched(self):
+        cves, skipped = self.scan({"cpe": "cpe:/a:apache:http_server:2.4.62"})
+        self.assertEqual(cves, {"CVE-2024-0001"})
+        self.assertEqual(skipped, {"CVE-2023-1111": "other_vendor"})
+
+    def test_the_vendor_itself_still_matches(self):
+        cves, skipped = self.scan({"cpe": "cpe:/a:akka:http_server:10.0.1"})
+        self.assertEqual(cves, {"CVE-2023-1111"})
+        self.assertEqual(skipped, {})
+
+    def test_without_a_vendor_nothing_is_excluded(self):
+        cves, _ = self.scan({"product": "http_server", "version": "2.4.62"})
+        self.assertEqual(cves, {"CVE-2023-1111", "CVE-2024-0001"})
+
+    def test_a_vendor_missing_from_the_list_still_matches(self):
+        """A rename (igor_sysoev -> f5) must keep its rows: only listed
+        vendors are dropped."""
+        cves, _ = self.scan({"cpe": "cpe:/a:apache_foundation:http_server:2.4.62"})
+        self.assertEqual(cves, {"CVE-2024-0001"})
+
+    def test_the_cache_keeps_vendors_apart(self):
+        cache = {}
+        self.scan({"cpe": "cpe:/a:apache:http_server:2.4.62"}, cache)
+        cves, _ = self.scan({"cpe": "cpe:/a:akka:http_server:2.4.62"}, cache)
+        self.assertIn("CVE-2023-1111", cves)
+        cves, skipped = self.scan({"cpe": "cpe:/a:apache:http_server:2.4.62"}, cache)
+        self.assertNotIn("CVE-2023-1111", cves)
+        self.assertEqual(skipped, {"CVE-2023-1111": "other_vendor"})
+
+    def test_shipped_list_loads_and_drops_its_comment(self):
+        foreign = _load_foreign_vendors()
+        self.assertIn("akka", foreign["http_server"])
+        self.assertFalse(any(k.startswith("_") for k in foreign))
+
+    def test_vendor_of_both_cpe_bindings(self):
+        self.assertEqual(_get_cpe_vendor_product({"cpe": "cpe:/a:apache:http_server:2.4.62"}),
+                         ("apache", "http_server"))
+        self.assertEqual(_get_cpe_vendor_product(
+            {"cpe": "cpe:2.3:a:apache:http_server:2.4.62:*:*:*:*:*:*:*"}),
+            ("apache", "http_server"))
+
+
+class TestCoarseVersion(unittest.TestCase):
+    """A version that names several releases gives potential matches only."""
+
+    def test_kinds(self):
+        for version, kind in (("3.X - 4.X", COARSE_RANGE),
+                              ("1.3.1 - 1.9.0", COARSE_RANGE),
+                              ("4 - 4.x", COARSE_RANGE),
+                              ("2.4.1 - 2.4.9", None),
+                              ("4", COARSE_MAJOR_ONLY),
+                              ("11", COARSE_MAJOR_ONLY),
+                              ("4.7", None),
+                              ("9.6p1", None),
+                              (None, None)):
+            with self.subTest(version=version):
+                self.assertEqual(coarse_version(parse_version(version)), kind)
+
+    def test_scan_flags_every_match(self):
+        conn = create_test_db()
+        try:
+            result = scan_service(conn.cursor(), {"product": "openssh", "version": "4"},
+                                  aliases=None, maxcve=0)
+            self.assertEqual(result["coarse_version"], COARSE_MAJOR_ONLY)
+            self.assertTrue(result["cves"])
+            self.assertTrue(all(c.get("coarse_version") for c in result["cves"]))
+
+            precise = scan_service(conn.cursor(), {"product": "openssh", "version": "4.7"},
+                                   aliases=None, maxcve=0)
+            self.assertNotIn("coarse_version", precise)
+            self.assertFalse(any("coarse_version" in c for c in precise["cves"]))
+        finally:
+            conn.close()
+
+
+class TestDateStamp(unittest.TestCase):
+    """A date-like build stamp is no version, unless NVD numbers the
+    product's releases by date."""
+
+    def test_detection(self):
+        for version, stamp in (("20260609.1000", True), ("20260609", True),
+                               ("20261309", False), ("2022.83", False),
+                               ("2.4.62", False), ("3.X - 4.X", False), (None, False)):
+            with self.subTest(version=version):
+                self.assertEqual(is_date_stamp(parse_version(version)), stamp)
+
+    def test_stamp_is_read_as_no_version(self):
+        conn = create_test_db()
+        try:
+            result = scan_service(conn.cursor(),
+                                  {"product": "openssh", "version": "20260609.1000"},
+                                  aliases=None, maxcve=0)
+            # Only the row without bounds matches, as for an unknown version.
+            self.assertEqual([c["cve_id"] for c in result["cves"]], ["CVE-2023-2222"])
+            self.assertEqual(result["match_info"]["version_ignored"],
+                             {"version": "20260609.1000", "reason": "date_stamp"})
+            self.assertFalse(result["match_info"]["version_known"])
+        finally:
+            conn.close()
+
+    def test_product_with_date_releases_keeps_its_version(self):
+        conn = create_test_db()
+        try:
+            cur = conn.cursor()
+            cur.execute("INSERT INTO products (vendor, product, version, version_update) "
+                        "VALUES ('eterna', 'bozohttpd', '*', '*')")
+            cur.execute("INSERT INTO multiaffected VALUES ('CVE-2024-0001', (SELECT "
+                        "product_id FROM products WHERE product='bozohttpd'), "
+                        "NULL, NULL, NULL, '20140708')")
+            result = scan_service(cur, {"product": "bozohttpd", "version": "20100920"},
+                                  aliases=None, maxcve=0)
+            self.assertEqual([c["cve_id"] for c in result["cves"]], ["CVE-2024-0001"])
+            self.assertNotIn("version_ignored", result["match_info"])
+        finally:
+            conn.close()
+
+
+class TestNvdCorpus(unittest.TestCase):
+    """Regression cases from the test-two scan corpus against a database built
+    from the real NVD records (testdata/nvd-corpus, see its cases.json).
+
+    Each case is one (CPE, nmap version, CVE) and the outcome it must get:
+    graded, possible:<flag>, skipped:<reason> or absent.
+    """
+
+    CORPUS = Path(__file__).parent / "testdata" / "nvd-corpus"
+
+    @classmethod
+    def setUpClass(cls):
+        from database import populate_from_raw
+        cls.tmp = tempfile.TemporaryDirectory()
+        db_path = Path(cls.tmp.name) / "corpus.db"
+        with mock.patch("sys.stderr"):  # tqdm progress bars
+            populate_from_raw(db_path, cls.CORPUS)
+        cls.conn = sql.connect(db_path)
+        with open(Path(__file__).parent / "product-aliases.json") as f:
+            cls.aliases = json.load(f)
+        with open(cls.CORPUS / "cases.json") as f:
+            cls.cases = json.load(f)["cases"]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.conn.close()
+        cls.tmp.cleanup()
+
+    @staticmethod
+    def outcome(result, cve_id):
+        for cve in result["cves"]:
+            if cve["cve_id"] == cve_id:
+                if cve.get("open_range"):
+                    return "possible:open_range"
+                if cve.get("coarse_version"):
+                    return "possible:coarse_version"
+                return "graded"
+        for skipped in result.get("skipped_cves", []):
+            if skipped["cve_id"] == cve_id:
+                return "skipped:" + skipped["reason"]
+        return "absent"
+
+    def test_every_case_gets_its_expected_outcome(self):
+        cur = self.conn.cursor()
+        cache, foreign = {}, _load_foreign_vendors()
+        wrong = []
+        for case in self.cases:
+            result = scan_service(cur, {"cpe": case["cpe"], "version": case["version"]},
+                                  self.aliases, 0, cache, foreign_vendors=foreign)
+            got = self.outcome(result, case["cve"])
+            if got != case["expect"]:
+                wrong.append(f"{case['cpe']} {case['version']!r} {case['cve']}: "
+                             f"expected {case['expect']}, got {got}")
+        self.assertGreater(len(self.cases), 600)
+        self.assertEqual(wrong, [], f"{len(wrong)} of {len(self.cases)} cases")
 
 
 if __name__ == "__main__":

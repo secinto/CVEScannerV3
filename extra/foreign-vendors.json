@@ -1,0 +1,10 @@
+{
+    "_comment": "Per NVD product name: vendors whose rows for that name describe a different product. cvescan does not match these rows when the scanned CPE names another vendor, and logs the CVE as skipped (other_vendor). Add a vendor only after reading its CVEs. A rename of the same product (exim -> university_of_cambridge, igor_sysoev -> f5) does not belong here.",
+    "http_server": {
+        "akka": "Akka HTTP, a Scala/Java library (CVE-2017-1000118, CVE-2021-42697, CVE-2023-44487)",
+        "a1webserver": "A1 HTTP server 1.0a (CVE-2001-0285, CVE-2001-0286)"
+    },
+    "python": {
+        "microsoft": "the Python extension for Visual Studio Code (CVE-2020-1171, CVE-2024-49050, ...)"
+    }
+}

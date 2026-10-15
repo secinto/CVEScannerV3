@@ -137,6 +137,52 @@ def parse_version(version):
             "empty": True, "range_": False}
 
 
+# A version that names more than one release. nmap reports a range when its
+# fingerprint cannot tell the releases apart ("3.X - 4.X" for Samba, "1.3.1 -
+# 1.9.0" for HAProxy) and a bare major when the banner gives no more ("4",
+# "11"). A match on such a version is true for some release it names, not
+# necessarily for the one that runs, so consumers report it as potential.
+COARSE_RANGE = "range"
+COARSE_MAJOR_ONLY = "major_only"
+
+
+def _major_minor(version):
+    return tuple(version.lower().split(".")[:2])
+
+
+def coarse_version(version_info):
+    """COARSE_RANGE for a range across more than one minor release,
+    COARSE_MAJOR_ONLY for a bare major version, else None.
+
+    A range inside one minor release ("2.4.1 - 2.4.9") is precise enough to
+    grade, as before.
+    """
+    if version_info["empty"]:
+        return None
+    if version_info["range_"]:
+        if _major_minor(version_info["from_"]) != _major_minor(version_info["to_"]):
+            return COARSE_RANGE
+        return None
+    if "." not in version_info["ver"]:
+        return COARSE_MAJOR_ONLY
+    return None
+
+
+# A build stamp that starts with a date (Exim "20260609.1000") is not a
+# release. Taken as a version it is far above every bound in NVD, so it
+# matches nothing that it should. It is read as "no version" unless the
+# product really numbers its releases by date (bozohttpd 20100920): see
+# _product_uses_date_versions.
+_RE_DATE_STAMP = re.compile(
+    r"^(?:19|20)\d\d(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])(?:\.|$)")
+_DATE_GLOB = "[12][09][0-9][0-9][01][0-9][0-3][0-9]*"
+
+
+def is_date_stamp(version_info):
+    return (not version_info["empty"] and not version_info["range_"]
+            and bool(_RE_DATE_STAMP.match(version_info["ver"])))
+
+
 def parse_cpe(cpe_str):
     """Extract product, version from a CPE string.
 
@@ -174,6 +220,11 @@ def _default_version(version, default):
     if version is None or version == "-":
         return default
     return version
+
+
+# skipped_cves reason for a CVE that matched only rows of another vendor's
+# product with the same name. The importer's reasons are in database.py.
+SKIP_OTHER_VENDOR = "other_vendor"
 
 
 def _add_cve_result(v, result, open_range=False):
@@ -290,37 +341,39 @@ def _to_float(val):
 # Database queries
 # ---------------------------------------------------------------------------
 
+# Every candidate query returns the row's vendor first: the matcher drops rows
+# of a vendor that names a different product (see foreign-vendors.json).
 QUERY_MULTIAFFECTED = """
-    SELECT multiaffected.cve_id, cves.cvss_v2, cves.cvss_v3,
+    SELECT products.vendor, multiaffected.cve_id, cves.cvss_v2, cves.cvss_v3,
            multiaffected.versionStartIncluding, multiaffected.versionStartExcluding,
            multiaffected.versionEndIncluding, multiaffected.versionEndExcluding,
            (SELECT EXISTS (SELECT 1 FROM referenced_exploit
             WHERE cve_id = multiaffected.cve_id)) as edb,
            (SELECT EXISTS (SELECT 1 FROM referenced_metasploit
             WHERE cve_id = multiaffected.cve_id)) as msf
-    FROM multiaffected
+    FROM products
+    INNER JOIN multiaffected ON products.product_id = multiaffected.product_id
     INNER JOIN cves ON multiaffected.cve_id = cves.cve_id
-    WHERE product_id IN
-          (SELECT product_id FROM products WHERE product = ? AND version = '*')
+    WHERE products.product = ? AND products.version = '*'
 """
 
 QUERY_MULTIAFFECTED_EMPTY = """
-    SELECT multiaffected.cve_id, cves.cvss_v2, cves.cvss_v3,
+    SELECT products.vendor, multiaffected.cve_id, cves.cvss_v2, cves.cvss_v3,
            (SELECT EXISTS (SELECT 1 FROM referenced_exploit
             WHERE cve_id = multiaffected.cve_id)) as edb,
            (SELECT EXISTS (SELECT 1 FROM referenced_metasploit
             WHERE cve_id = multiaffected.cve_id)) as msf
-    FROM multiaffected
+    FROM products
+    INNER JOIN multiaffected ON products.product_id = multiaffected.product_id
     INNER JOIN cves ON multiaffected.cve_id = cves.cve_id
-    WHERE product_id IN
-          (SELECT product_id FROM products
-           WHERE product = ? AND version = '*' AND version_update = '*')
+    WHERE products.product = ? AND products.version = '*'
+    AND products.version_update = '*'
     AND versionStartIncluding IS NULL AND versionStartExcluding IS NULL
     AND versionEndIncluding IS NULL AND versionEndExcluding IS NULL
 """
 
 QUERY_AFFECTED = """
-    SELECT affected.cve_id, cves.cvss_v2, cves.cvss_v3,
+    SELECT products.vendor, affected.cve_id, cves.cvss_v2, cves.cvss_v3,
            products.version, products.version_update,
            (SELECT EXISTS (SELECT 1 FROM referenced_exploit
             WHERE cve_id = affected.cve_id)) as edb,
@@ -333,11 +386,25 @@ QUERY_AFFECTED = """
 """
 
 QUERY_SKIPPED = """
-    SELECT cve_id, version, version_update,
+    SELECT vendor, cve_id, version, version_update,
            versionStartIncluding, versionStartExcluding,
            versionEndIncluding, versionEndExcluding, reason
     FROM skipped_affected
     WHERE product = ?
+"""
+
+# Does the product number any release by date? Then a date-like version is
+# a real one (see is_date_stamp).
+QUERY_DATE_VERSIONS = """
+    SELECT 1 FROM products
+    LEFT JOIN multiaffected ON products.product_id = multiaffected.product_id
+    WHERE products.product = :product
+    AND (products.version GLOB :pattern
+         OR multiaffected.versionStartIncluding GLOB :pattern
+         OR multiaffected.versionStartExcluding GLOB :pattern
+         OR multiaffected.versionEndIncluding GLOB :pattern
+         OR multiaffected.versionEndExcluding GLOB :pattern)
+    LIMIT 1
 """
 
 QUERY_EXPLOIT_INFO = """
@@ -428,14 +495,15 @@ def _target_versions(version_info):
     return from_v, to_v, version_info["vup"]
 
 
-def find_skipped(cur, product, version_info):
+def find_skipped(cur, product, version_info, exclude_vendors=frozenset()):
     """CVEs the database importer left out for product (skipped_affected)
     that this version would have matched, as {cve_id: reason}.
 
     Never findings: the importer left them out because NVD does not mark the
     product vulnerable on its own (see database.classify_cpes). Reported so
     that a scan can log what it no longer shows. Empty for an unknown version
-    and for a database built before the table existed.
+    and for a database built before the table existed. Rows of
+    exclude_vendors belong to another product and are not listed.
     """
     if version_info["empty"]:
         return {}
@@ -445,7 +513,9 @@ def find_skipped(cur, product, version_info):
         return {}
     from_v, to_v, upd = _target_versions(version_info)
     exact, ranged = [], []
-    for cve_id, ver, vup, st_in, st_ex, en_in, en_ex, reason in cur.fetchall():
+    for vendor, cve_id, ver, vup, st_in, st_ex, en_in, en_ex, reason in cur.fetchall():
+        if vendor in exclude_vendors:
+            continue
         # Keyed by (cve, reason): one CVE can be skipped for two reasons.
         row = {"id": (cve_id, reason), "cvss_v2": None, "cvss_v3": None,
                "exploitdb": 0, "metasploit": 0}
@@ -464,23 +534,35 @@ def find_skipped(cur, product, version_info):
     return skipped
 
 
-def find_vulnerabilities(cur, product, version_info):
+def find_vulnerabilities(cur, product, version_info,
+                         exclude_vendors=frozenset(), foreign=None):
     """Main CVE lookup for a single product/version.
     Mirrors Lua vulnerabilities() — queries both affected and multiaffected tables.
+
+    Rows of exclude_vendors name another vendor's product with the same name
+    (akka:http_server for a scanned apache:http_server). They are matched into
+    `foreign` when a dict is given, so the caller can log them, and never into
+    the result.
 
     Returns dict {cve_id: {cvss_v2, cvss_v3, exploitdb, metasploit}}.
     """
     from_v, to_v, upd = _target_versions(version_info)
     vulns = {}
+    if foreign is None:
+        foreign = {}
+
+    def target(vendor):
+        return foreign if vendor in exclude_vendors else vulns
 
     if version_info["empty"]:
         # When version is unknown, only match multiaffected entries
         # that have no version boundaries at all
         cur.execute(QUERY_MULTIAFFECTED_EMPTY, [product])
         for row in cur.fetchall():
-            cve_id, cvss_v2, cvss_v3, edb, msf = row
-            if cve_id not in vulns:
-                vulns[cve_id] = {
+            vendor, cve_id, cvss_v2, cvss_v3, edb, msf = row
+            hits = target(vendor)
+            if cve_id not in hits:
+                hits[cve_id] = {
                     "cvss_v2": cvss_v2, "cvss_v3": cvss_v3,
                     "exploitdb": edb, "metasploit": msf,
                     "open_range": True,
@@ -488,28 +570,32 @@ def find_vulnerabilities(cur, product, version_info):
     else:
         # Query multiaffected (version ranges)
         cur.execute(QUERY_MULTIAFFECTED, [product])
-        multi_candidates = []
+        multi_candidates = {}
         for row in cur.fetchall():
-            cve_id, cvss_v2, cvss_v3, st_in, st_ex, en_in, en_ex, edb, msf = row
-            multi_candidates.append({
+            vendor, cve_id, cvss_v2, cvss_v3, st_in, st_ex, en_in, en_ex, edb, msf = row
+            multi_candidates.setdefault(vendor in exclude_vendors, []).append({
                 "id": cve_id, "cvss_v2": cvss_v2, "cvss_v3": cvss_v3,
                 "start_inc": st_in, "start_exc": st_ex,
                 "end_inc": en_in, "end_exc": en_ex,
                 "exploitdb": edb, "metasploit": msf,
             })
-        match_range_versions(multi_candidates, from_v, to_v, vulns)
 
         # Query affected (exact versions)
         cur.execute(QUERY_AFFECTED, [product])
-        exact_candidates = []
+        exact_candidates = {}
         for row in cur.fetchall():
-            cve_id, cvss_v2, cvss_v3, ver, vupdate, edb, msf = row
-            exact_candidates.append({
+            vendor, cve_id, cvss_v2, cvss_v3, ver, vupdate, edb, msf = row
+            exact_candidates.setdefault(vendor in exclude_vendors, []).append({
                 "id": cve_id, "cvss_v2": cvss_v2, "cvss_v3": cvss_v3,
                 "version": ver, "version_update": vupdate,
                 "exploitdb": edb, "metasploit": msf,
             })
-        match_exact_versions(exact_candidates, from_v, to_v, upd, vulns)
+
+        for excluded, hits in ((False, vulns), (True, foreign)):
+            match_range_versions(multi_candidates.get(excluded, []),
+                                 from_v, to_v, hits)
+            match_exact_versions(exact_candidates.get(excluded, []),
+                                 from_v, to_v, upd, hits)
 
     return vulns
 
@@ -618,17 +704,52 @@ def _load_cpe_to_pkg(path):
     return {}
 
 
+def _load_foreign_vendors(path=None):
+    """{product: {vendor: why}}: vendors whose rows for that product name
+    describe a different product (foreign-vendors.json)."""
+    path = Path(path) if path else Path(__file__).parent / "foreign-vendors.json"
+    if not path.is_file():
+        return {}
+    with open(path) as f:
+        data = json.load(f)
+    return {product: vendors for product, vendors in data.items()
+            if not product.startswith("_")}
+
+
+def _excluded_vendors(foreign_vendors, product, scanned_vendor):
+    """Vendors whose rows for product the scan must not match.
+
+    Only when the scan names a vendor: without one there is nothing to tell
+    the products apart. A vendor the scan itself reports is never excluded.
+    """
+    if not scanned_vendor:
+        return frozenset()
+    return frozenset(v for v in foreign_vendors.get(product, ())
+                     if v != scanned_vendor)
+
+
 def _get_cpe_vendor_product(service):
     """Extract vendor and product from service CPE or product field.
 
-    Returns (vendor, product) tuple.
+    Returns (vendor, product) tuple. Handles both CPE bindings, like
+    parse_cpe: the 2.3 string carries one more leading component.
     """
     if service.get("cpe"):
         parts = service["cpe"].split(":")
-        vendor = parts[2] if len(parts) > 2 else None
-        product = parts[3] if len(parts) > 3 else None
+        offset = 3 if len(parts) > 1 and parts[1] == "2.3" else 2
+        vendor = parts[offset] if len(parts) > offset else None
+        product = parts[offset + 1] if len(parts) > offset + 1 else None
         return vendor, product
     return None, service.get("product")
+
+
+def _product_uses_date_versions(cur, names):
+    """True when NVD numbers a release of any of these products by date."""
+    for name in names:
+        cur.execute(QUERY_DATE_VERSIONS, {"product": name, "pattern": _DATE_GLOB})
+        if cur.fetchone():
+            return True
+    return False
 
 
 def _resolve_pkg_name(value, release):
@@ -859,18 +980,22 @@ def annotate_confidence(cve_list, distro, distro_release, backport_results,
 # ---------------------------------------------------------------------------
 
 def scan_service(cur, service, aliases, maxcve, cache=None,
-                 cpe_to_pkg=None, online=False):
+                 cpe_to_pkg=None, online=False, foreign_vendors=None):
     """Scan a single service entry and return a result dict.
 
     cache: optional dict shared across services to avoid re-querying the same
            product|version|vupdate combination.  Mirrors Lua registry.cache.
     cpe_to_pkg: CPE-to-distro-package mapping dict.
     online: if True, query OSV.dev API for uncertain CVEs.
+    foreign_vendors: {product: {vendor: why}}, rows the scan must not match
+           when the service's CPE names another vendor (_load_foreign_vendors).
     """
     if cache is None:
         cache = {}
     if cpe_to_pkg is None:
         cpe_to_pkg = {}
+    if foreign_vendors is None:
+        foreign_vendors = {}
 
     # Resolve product and version info
     if service.get("cpe"):
@@ -890,6 +1015,18 @@ def scan_service(cur, service, aliases, maxcve, cache=None,
     if vup_override:
         version_info["vup"] = vup_override
 
+    # Query for all product name variants (original + aliases)
+    all_products = resolve_aliases(product, aliases)
+    scanned_vendor, _ = _get_cpe_vendor_product(service)
+
+    ignored_version = None
+    if (is_date_stamp(version_info)
+            and not _product_uses_date_versions(cur, all_products)):
+        ignored_version = version_info["ver"] + (
+            "" if version_info["vup"] == "*" else version_info["vup"])
+        version_info = parse_version(None)
+    coarse = coarse_version(version_info)
+
     # Determine version display strings
     if version_info["range_"]:
         ver_display = f"{version_info['from_']} - {version_info['to_']}"
@@ -907,17 +1044,22 @@ def scan_service(cur, service, aliases, maxcve, cache=None,
     from ssh_fingerprint import crypto_from_service
     crypto = crypto_from_service(service)
 
-    # Query for all product name variants (original + aliases)
-    all_products = resolve_aliases(product, aliases)
     all_vulns = {}
+    other_vendor = {}
 
     for prod_name in all_products:
-        cache_key = f"{prod_name}|{ver_display}|{vup_display}"
+        excluded = _excluded_vendors(foreign_vendors, prod_name, scanned_vendor)
+        cache_key = (f"{prod_name}|{ver_display}|{vup_display}|"
+                     f"{','.join(sorted(excluded))}")
         if cache_key in cache:
-            prod_vulns = cache[cache_key]
+            prod_vulns, prod_foreign = cache[cache_key]
         else:
-            prod_vulns = find_vulnerabilities(cur, prod_name, version_info)
-            cache[cache_key] = prod_vulns
+            prod_foreign = {}
+            prod_vulns = find_vulnerabilities(cur, prod_name, version_info,
+                                              excluded, prod_foreign)
+            cache[cache_key] = (prod_vulns, prod_foreign)
+        for cve_id in prod_foreign:
+            other_vendor.setdefault(cve_id, prod_name)
         # Merge per CVE rather than dict.update: an alias that matched only
         # through an open range must not hide a bounded match from another.
         # Copies, because the cache shares these dicts across services.
@@ -934,9 +1076,15 @@ def scan_service(cur, service, aliases, maxcve, cache=None,
     # finding, so it is not listed here.
     skipped = {}
     for prod_name in all_products:
-        for cve_id, reason in find_skipped(cur, prod_name, version_info).items():
+        excluded = _excluded_vendors(foreign_vendors, prod_name, scanned_vendor)
+        for cve_id, reason in find_skipped(cur, prod_name, version_info,
+                                           excluded).items():
             if cve_id not in all_vulns:
                 skipped.setdefault(cve_id, reason)
+    # The same for rows of another vendor's product with this name.
+    for cve_id in other_vendor:
+        if cve_id not in all_vulns:
+            skipped.setdefault(cve_id, SKIP_OTHER_VENDOR)
 
     # Sort by CVSS score
     sorted_cves = rank_cves(all_vulns)
@@ -960,6 +1108,10 @@ def scan_service(cur, service, aliases, maxcve, cache=None,
             # NVD gave no version range: the match says nothing about the
             # version that is running. Consumers report it as potential.
             cve_entry["open_range"] = True
+        if coarse:
+            # The scan names several releases: the CVE affects one of them,
+            # maybe not the one that runs. Consumers report it as potential.
+            cve_entry["coarse_version"] = True
         if cve_id in exploits_by_cve:
             cve_entry["exploitdb"] = exploits_by_cve[cve_id]
         if cve_id in metasploits_by_cve:
@@ -1039,6 +1191,10 @@ def scan_service(cur, service, aliases, maxcve, cache=None,
         "queried_names": all_products,
         "version_known": not version_info["empty"],
     }
+    if ignored_version:
+        # Read as no version: a date-like build stamp is not a release.
+        match_info["version_ignored"] = {"version": ignored_version,
+                                         "reason": "date_stamp"}
     if not all_vulns:
         match_info.update(diagnose_no_match(cur, all_products, version_info))
     result["match_info"] = match_info
@@ -1058,6 +1214,8 @@ def scan_service(cur, service, aliases, maxcve, cache=None,
         result["ssh_crypto"] = crypto
     if patched_cves:
         result["likely_patched"] = patched_cves
+    if coarse:
+        result["coarse_version"] = coarse
     if skipped:
         result["skipped_cves"] = [
             {"cve_id": cve_id, "reason": reason}
@@ -1071,13 +1229,17 @@ def scan_service(cur, service, aliases, maxcve, cache=None,
 
 
 def run_scan(db_path, services, aliases=None, maxcve=0,
-             cpe_to_pkg=None, online=False):
+             cpe_to_pkg=None, online=False, foreign_vendors=None):
     """Run CVE scan for a list of service dicts.
+
+    foreign_vendors: defaults to extra/foreign-vendors.json.
 
     Returns the full output dict with metadata and results.
     """
     if cpe_to_pkg is None:
         cpe_to_pkg = _load_cpe_to_pkg(None)
+    if foreign_vendors is None:
+        foreign_vendors = _load_foreign_vendors()
 
     results = []
     cache = {}  # shared across all services (mirrors Lua registry.cache)
@@ -1087,6 +1249,7 @@ def run_scan(db_path, services, aliases=None, maxcve=0,
                 result = scan_service(
                     cur, service, aliases, maxcve, cache,
                     cpe_to_pkg=cpe_to_pkg, online=online,
+                    foreign_vendors=foreign_vendors,
                 )
                 if result is not None:
                     results.append(result)
@@ -1356,6 +1519,13 @@ def format_table(output, color=False):
         else:
             ver_disp = ver + (vup if vup and vup != "*" else "")
         lines.append(f"  Product : {result['product']}   Version: {ver_disp}")
+        ignored = (result.get("match_info") or {}).get("version_ignored")
+        if ignored:
+            lines.append(pal(f"            {ignored['version']} is a date stamp, "
+                             "not a release: matched as no version", "gray"))
+        if result.get("coarse_version"):
+            lines.append(pal("            Version names several releases: "
+                             "matches are possible, not graded", "gray"))
 
         if result.get("cpe"):
             lines.append(f"  CPE     : {result['cpe']}")
