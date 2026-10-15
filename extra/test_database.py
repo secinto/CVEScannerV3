@@ -186,3 +186,200 @@ class TestClassifyCpesReasons(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── NVD raw cache, offline import and build stamp ──────────────────────────
+
+import json  # noqa: E402
+import sqlite3  # noqa: E402
+import tempfile  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+import database  # noqa: E402
+
+
+def _cve(cve_id, criteria, modified="2026-01-01T00:00:00.000", status="Analyzed",
+         **match):
+    return {
+        "id": cve_id, "vulnStatus": status, "published": "2020-05-01T00:00:00.000",
+        "lastModified": modified, "metrics": {},
+        "configurations": [{"nodes": [{"operator": "OR", "negate": False,
+                                       "cpeMatch": [dict(vulnerable=True, criteria=criteria, **match)]}]}],
+        "references": [],
+    }
+
+
+def _write_lines(path, items):
+    with open(path, "w") as f:
+        for item in items:
+            f.write((item if isinstance(item, str) else json.dumps(item, separators=(",", ":"))) + "\n")
+
+
+class TestRawDeltaWindow(unittest.TestCase):
+    NOW = datetime(2026, 10, 15, tzinfo=timezone.utc)
+
+    def test_no_cache_means_full_fetch(self):
+        self.assertEqual(database.raw_delta_window(None, self.NOW), "")
+
+    def test_full_flag_wins_over_a_recent_cache(self):
+        meta = {"last_mod": (self.NOW - timedelta(days=1)).isoformat()}
+        self.assertEqual(database.raw_delta_window(meta, self.NOW, full=True), "")
+
+    def test_recent_cache_asks_for_the_changes_since_last_mod(self):
+        meta = {"last_mod": (self.NOW - timedelta(days=3)).isoformat()}
+        window = database.raw_delta_window(meta, self.NOW)
+        self.assertIn("lastModStartDate=2026-10-12", window)
+        self.assertIn("lastModEndDate=2026-10-15", window)
+
+    def test_cache_older_than_nvds_window_is_fetched_in_full(self):
+        meta = {"last_mod": (self.NOW - timedelta(days=database.RAW_MAX_DELTA_DAYS + 1)).isoformat()}
+        self.assertEqual(database.raw_delta_window(meta, self.NOW), "")
+
+
+class TestMergeRaw(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.raw = Path(self.tmp.name)
+        self.delta = self.raw / "delta"
+        self.delta.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _cves(self):
+        with (self.raw / "cves.jsonl").open() as f:
+            return {c["id"]: c for c in map(json.loads, f)}
+
+    def test_delta_replaces_changed_cves_and_keeps_the_rest(self):
+        _write_lines(self.raw / "cves.jsonl", [
+            _cve("CVE-2020-0001", "cpe:2.3:a:v:p:1.0:*:*:*:*:*:*:*"),
+            _cve("CVE-2020-0002", "cpe:2.3:a:v:p:2.0:*:*:*:*:*:*:*"),
+        ])
+        _write_lines(self.delta / "cves_000000000", [
+            _cve("CVE-2020-0002", "cpe:2.3:a:v:p:2.1:*:*:*:*:*:*:*", modified="2026-02-01T00:00:00.000"),
+            _cve("CVE-2020-0003", "cpe:2.3:a:v:p:3.0:*:*:*:*:*:*:*"),
+        ])
+        counts = database.merge_raw(self.raw, self.delta)
+        cves = self._cves()
+        self.assertEqual(counts["cves"], 3)
+        self.assertEqual(set(cves), {"CVE-2020-0001", "CVE-2020-0002", "CVE-2020-0003"})
+        self.assertIn(":2.1:", cves["CVE-2020-0002"]["configurations"][0]["nodes"][0]["cpeMatch"][0]["criteria"])
+
+    def test_the_newest_copy_wins_when_a_cve_appears_on_two_pages(self):
+        """NVD paging over changing data can return one CVE twice."""
+        _write_lines(self.delta / "cves_000000000", [
+            _cve("CVE-2020-0001", "cpe:2.3:a:v:p:new:*:*:*:*:*:*:*", modified="2026-03-01T00:00:00.000")])
+        _write_lines(self.delta / "cves_000002000", [
+            _cve("CVE-2020-0001", "cpe:2.3:a:v:p:old:*:*:*:*:*:*:*", modified="2026-01-01T00:00:00.000")])
+        database.merge_raw(self.raw, self.delta, full=True)
+        crit = self._cves()["CVE-2020-0001"]["configurations"][0]["nodes"][0]["cpeMatch"][0]["criteria"]
+        self.assertIn(":new:", crit)
+
+    def test_full_merge_drops_the_old_cache(self):
+        _write_lines(self.raw / "cves.jsonl", [_cve("CVE-2019-0001", "cpe:2.3:a:v:p:1:*:*:*:*:*:*:*")])
+        _write_lines(self.raw / "cpes.txt", ["cpe:2.3:a:old:old:1:*:*:*:*:*:*:*"])
+        _write_lines(self.delta / "cves_000000000", [_cve("CVE-2020-0001", "cpe:2.3:a:v:p:1:*:*:*:*:*:*:*")])
+        _write_lines(self.delta / "cpes_000000000", ["cpe:2.3:a:new:new:1:*:*:*:*:*:*:*"])
+        counts = database.merge_raw(self.raw, self.delta, full=True)
+        self.assertEqual(set(self._cves()), {"CVE-2020-0001"})
+        self.assertEqual((self.raw / "cpes.txt").read_text().split(), ["cpe:2.3:a:new:new:1:*:*:*:*:*:*:*"])
+        self.assertEqual(counts, {"cves": 1, "cpes": 1})
+
+    def test_cpes_are_merged_sorted_and_unique(self):
+        _write_lines(self.raw / "cpes.txt", ["cpe:2.3:a:b:b:1:*:*:*:*:*:*:*"])
+        _write_lines(self.delta / "cpes_000000000",
+                     ["cpe:2.3:a:a:a:1:*:*:*:*:*:*:*", "cpe:2.3:a:b:b:1:*:*:*:*:*:*:*"])
+        database.merge_raw(self.raw, self.delta)
+        self.assertEqual((self.raw / "cpes.txt").read_text().split(),
+                         ["cpe:2.3:a:a:a:1:*:*:*:*:*:*:*", "cpe:2.3:a:b:b:1:*:*:*:*:*:*:*"])
+
+
+class TestPopulateFromRaw(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.raw = Path(self.tmp.name) / "raw"
+        self.raw.mkdir()
+        self.db = Path(self.tmp.name) / "cve.db"
+        _write_lines(self.raw / "cpes.txt", ["cpe:2.3:a:exim:exim:4.100:*:*:*:*:*:*:*",
+                                             "cpe:2.3:o:linux:linux_kernel:6.1:*:*:*:*:*:*:*"])
+        _write_lines(self.raw / "cves.jsonl", [
+            _cve("CVE-2020-0001", "cpe:2.3:a:exim:exim:4.92:*:*:*:*:*:*:*"),
+            _cve("CVE-2020-0002", "cpe:2.3:a:exim:exim:*:*:*:*:*:*:*:*", versionEndExcluding="4.94"),
+            _cve("CVE-2020-0003", "cpe:2.3:a:exim:exim:4.92:*:*:*:*:*:*:*", status="Rejected"),
+        ])
+        (self.raw / "meta.json").write_text(json.dumps(
+            {"last_mod": "2026-10-14T03:00:00+00:00", "cves": 3, "cpes": 2}))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _query(self, sql_text):
+        con = sqlite3.connect(self.db)
+        try:
+            return con.execute(sql_text).fetchall()
+        finally:
+            con.close()
+
+    def test_builds_the_same_rows_as_the_api_path(self):
+        database.populate_from_raw(self.db, self.raw)
+        self.assertEqual(self._query("SELECT cve_id FROM cves ORDER BY cve_id"),
+                         [("CVE-2020-0001",), ("CVE-2020-0002",)])
+        self.assertEqual(self._query("SELECT cve_id FROM affected"), [("CVE-2020-0001",)])
+        self.assertEqual(self._query("SELECT cve_id, versionEndExcluding FROM multiaffected"),
+                         [("CVE-2020-0002", "4.94")])
+
+    def test_small_batches_still_link_rows_to_their_products(self):
+        """A full affected batch must not be written before its products."""
+        with (self.raw / "cves.jsonl").open("a") as f:
+            f.write(json.dumps(_cve("CVE-2020-0004", "cpe:2.3:a:exim:exim:4.93:*:*:*:*:*:*:*")) + "\n")
+        # Size 2: the second affected row fills its batch while its product
+        # still waits in the products batch.
+        original = database._BatchSink.__init__.__defaults__
+        database._BatchSink.__init__.__defaults__ = (2,)
+        try:
+            database.populate_from_raw(self.db, self.raw)
+        finally:
+            database._BatchSink.__init__.__defaults__ = original
+        self.assertEqual(self._query("SELECT COUNT(*) FROM affected WHERE product_id IS NULL"), [(0,)])
+        self.assertEqual(self._query("SELECT COUNT(*) FROM affected"), [(2,)])
+
+    def test_only_application_cpes_become_products(self):
+        database.populate_from_raw(self.db, self.raw)
+        products = {r[0] for r in self._query("SELECT product FROM products")}
+        self.assertIn("exim", products)
+        self.assertNotIn("linux_kernel", products)
+
+    def test_last_mod_comes_from_the_cache_not_the_clock(self):
+        """A later incremental API update must continue from the cache's time."""
+        database.populate_from_raw(self.db, self.raw)
+        self.assertEqual(self._query("SELECT last_mod FROM metadata"),
+                         [("2026-10-14T03:00:00+00:00",)])
+
+    def test_an_existing_database_is_replaced(self):
+        self.db.write_bytes(b"not a database")
+        database.populate_from_raw(self.db, self.raw)
+        self.assertEqual(len(self._query("SELECT cve_id FROM cves")), 2)
+
+    def test_missing_cache_is_an_error(self):
+        with self.assertRaises(database.DatabaseUpdateError):
+            database.populate_from_raw(self.db, Path(self.tmp.name) / "nothing")
+
+
+class TestBuildStamp(unittest.TestCase):
+    def test_backports_key_is_order_independent(self):
+        a = database.backports_config_key(["Debian:12", "AlmaLinux:9"], True, ["openssh", "bind"],
+                                          ["9", "8"], False)
+        b = database.backports_config_key(["AlmaLinux:9", "Debian:12"], True, ["bind", "openssh"],
+                                          ["8", "9"], False)
+        self.assertEqual(a, b)
+        self.assertEqual(a, "osv=AlmaLinux:9,Debian:12|redhat=bind,openssh@8,9|ubuntu=-")
+
+    def test_curated_overlay_stamps_its_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "cve.db"
+            curated = Path(tmp) / "curated.json"
+            curated.write_text(json.dumps({"dispositions": []}))
+            database.load_curated_dispositions(db_path, curated)
+            with database.Database(db_path) as db:
+                info = db.build_info()
+            self.assertEqual(info["curated_sha256"], database.file_sha256(curated))

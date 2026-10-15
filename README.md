@@ -437,6 +437,42 @@ The NVD API key can be provided via:
 2. `NVD_KEY` environment variable
 3. `.api` file in the working directory
 
+### NVD raw cache and offline rebuilds
+
+The NVD API is the slow part of a build. `extra/database.py` can keep every
+NVD `cve` object in a raw cache directory and build a database from it
+offline. A change to the import rules then needs a few seconds of import, not
+a new NVD fetch:
+
+```bash
+# Bring the cache up to date: only what NVD changed since the cache's
+# last_mod, or everything when there is no cache (or it is over 110 days old)
+python extra/database.py --raw-dir nvd-raw --refresh-raw
+
+# Build a new cve.db from the cache, offline apart from Metasploit/exploit-db
+python extra/database.py -d cve.db --raw-dir nvd-raw --from-raw -ns
+
+# Both, plus backports, as the CVEScannerV3DB workflow runs it
+python extra/database.py -d cve.db --raw-dir nvd-raw --refresh-raw --from-raw -ns --backports
+
+# Apply only the curated overlay to an existing database
+python extra/database.py -d cve.db --curated-only --curated extra/curated_dispositions.json
+```
+
+The `build_info` table records what a database was built from
+(`importer_sha256`, `nvd_source`, `backports_config`, `curated_sha256`, ...).
+Builders compare it with their inputs and redo only the stale step.
+
+To see what a change to the import rules does, compare it with `origin/master`
+on the full NVD data (the cache is downloaded from the CVEScannerV3DB `nvd-raw`
+release on first use):
+
+```bash
+make compare-rules                          # totals + the 30 largest product changes
+make compare-rules ARGS="--product exim"    # plus the CVEs that differ for exim
+make compare-rules BASE=my-branch           # any ref that already has --from-raw
+```
+
 ## Database info
 
 View database statistics:
