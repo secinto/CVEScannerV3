@@ -405,6 +405,29 @@ python extra/cvescan.py scan -p openssh -v 4.7 -o results.json
 python extra/cvescan.py scan -p openssh -v 4.7 --maxcve 5
 ```
 
+### How the matcher reads vendors and versions
+
+- **Other vendors' products.** NVD uses one product name for different
+  products: `akka:http_server` is the Akka HTTP library, not Apache httpd.
+  `extra/foreign-vendors.json` lists, per product name, the vendors whose rows
+  describe a different product. When the scanned CPE names another vendor,
+  those rows do not match; the CVE is listed in `skipped_cves` with the reason
+  `other_vendor`. Vendors that are not listed always match, so a renamed
+  vendor (`igor_sysoev` → `f5`, `exim` → `university_of_cambridge`) keeps its
+  CVEs. Add a vendor only after you read its CVEs.
+- **Coarse versions.** A range across more than one minor release
+  (`3.X - 4.X`, `1.3.1 - 1.9.0`) or a bare major version (`4`) names several
+  releases. The CVEs still match, but each one carries `"coarse_version": true`
+  and the result carries `"coarse_version": "range"` or `"major_only"`.
+  checkfix_test reports them as possible, not graded.
+- **Date stamps.** A version that starts with a date (`20260609.1000`) is read
+  as no version, unless NVD numbers a release of the product by date
+  (bozohttpd). `match_info.version_ignored` records it.
+
+`extra/testdata/nvd-corpus` holds the NVD records and 604 expected outcomes
+from production scans. `TestNvdCorpus` builds a database from them and checks
+every case; add a case there when a scan shows a wrong match.
+
 ## Database management
 
 Build or update the CVE database:
