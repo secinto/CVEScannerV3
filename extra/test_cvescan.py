@@ -3,6 +3,7 @@
 """Tests for cvescan.py — Standalone CVE detection/association engine."""
 
 import json
+import os
 import sqlite3 as sql
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent))
 
 from cvescan import (
+    find_skipped,
     _detect_distro,
     _load_cpe_to_pkg,
     annotate_confidence,
@@ -648,6 +650,149 @@ class TestFindVulnerabilities(unittest.TestCase):
         vulns = find_vulnerabilities(self.cur, "openssh", info)
         # Should NOT match >=4.0 <9.0
         self.assertNotIn("CVE-2020-1234", vulns)
+
+
+class TestOpenRange(unittest.TestCase):
+    """A match through a range row without bounds is flagged open_range."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.conn = create_test_db()
+        cls.cur = cls.conn.cursor()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.cur.close()
+        cls.conn.close()
+
+    @staticmethod
+    def _candidate(cve_id, st_in=None, st_ex=None, en_in=None, en_ex=None):
+        return {"id": cve_id, "cvss_v2": None, "cvss_v3": 5.0,
+                "start_inc": st_in, "start_exc": st_ex,
+                "end_inc": en_in, "end_exc": en_ex,
+                "exploitdb": 0, "metasploit": 0}
+
+    def test_unbounded_row_is_flagged(self):
+        vulns = find_vulnerabilities(self.cur, "openssh", parse_version("4.7"))
+        self.assertTrue(vulns["CVE-2023-2222"]["open_range"])
+
+    def test_bounded_row_is_not_flagged(self):
+        vulns = find_vulnerabilities(self.cur, "openssh", parse_version("4.7"))
+        self.assertFalse(vulns["CVE-2020-1234"]["open_range"])
+
+    def test_exact_row_is_not_flagged(self):
+        vulns = find_vulnerabilities(self.cur, "openssh", parse_version("4.7p1"))
+        self.assertFalse(vulns["CVE-2016-1908"]["open_range"])
+
+    def test_a_bounded_row_settles_an_open_one(self):
+        """Order must not matter: either row arriving second still settles it."""
+        for rows in ([self._candidate("CVE-X"), self._candidate("CVE-X", en_ex="9.0")],
+                     [self._candidate("CVE-X", en_ex="9.0"), self._candidate("CVE-X")]):
+            result = {}
+            match_range_versions(rows, "4.7", "4.7", result)
+            self.assertFalse(result["CVE-X"]["open_range"])
+
+    def test_an_exact_row_settles_an_open_one(self):
+        result = {}
+        match_range_versions([self._candidate("CVE-X")], "4.7", "4.7", result)
+        match_exact_versions([{"id": "CVE-X", "cvss_v2": None, "cvss_v3": 5.0,
+                               "version": "4.7", "version_update": "*",
+                               "exploitdb": 0, "metasploit": 0}],
+                             "4.7", "4.7", "*", result)
+        self.assertFalse(result["CVE-X"]["open_range"])
+
+    def test_scan_service_reports_the_flag_only_when_set(self):
+        result = scan_service(self.cur, {"product": "openssh", "version": "4.7"},
+                              aliases=None, maxcve=0)
+        by_id = {c["cve_id"]: c for c in result["cves"]}
+        self.assertIs(by_id["CVE-2023-2222"].get("open_range"), True)
+        self.assertNotIn("open_range", by_id["CVE-2020-1234"])
+
+    def test_alias_with_a_bounded_match_wins_over_an_open_one(self):
+        """openssh matches CVE-2023-2222 openly; an alias with a bounded row
+        for the same CVE must clear the flag."""
+        self.cur.execute(
+            "INSERT OR IGNORE INTO products (vendor, product, version, version_update) "
+            "VALUES ('openbsd', 'openssh_alias', '*', '*')")
+        self.cur.execute(
+            "INSERT OR IGNORE INTO multiaffected VALUES ('CVE-2023-2222', "
+            "(SELECT product_id FROM products WHERE product='openssh_alias' AND version='*'), "
+            "NULL, NULL, NULL, '9.0')")
+        try:
+            cache = {}
+            for _ in range(2):  # the second pass reads the shared cache
+                result = scan_service(
+                    self.cur, {"product": "openssh", "version": "4.7"},
+                    aliases={"openssh": ["openssh_alias"]}, maxcve=0, cache=cache)
+                by_id = {c["cve_id"]: c for c in result["cves"]}
+                self.assertNotIn("open_range", by_id["CVE-2023-2222"])
+            # The open match stays cached as open for a service without the alias.
+            alone = scan_service(self.cur, {"product": "openssh", "version": "4.7"},
+                                 aliases=None, maxcve=0, cache=cache)
+            by_id = {c["cve_id"]: c for c in alone["cves"]}
+            self.assertIs(by_id["CVE-2023-2222"].get("open_range"), True)
+        finally:
+            self.conn.rollback()
+
+
+class TestSkipped(unittest.TestCase):
+    """Rows the importer left out are listed, never matched as findings."""
+
+    def setUp(self):
+        import tempfile
+        from database import Database, SKIP_NOT_VULNERABLE, SKIP_WILDCARD_BESIDE_VERSION
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        with Database(self.tmp.name) as db:
+            db.setup()
+            row = ("CVE-2004-0399", "university_of_cambridge", "exim", "*", "*",
+                   "", "", "", "", SKIP_WILDCARD_BESIDE_VERSION)
+            # Twice: an incremental update must not duplicate the row.
+            db.insert_skipped([row, row])
+            db.insert_skipped([
+                ("CVE-2011-2688", "apache", "http_server", "*", "*",
+                 "", "", "2.2.99", "", SKIP_NOT_VULNERABLE),
+                ("CVE-2099-0001", "apache", "http_server", "2.4.57", "*",
+                 "", "", "", "", SKIP_NOT_VULNERABLE),
+            ])
+        self.conn = sql.connect(self.tmp.name)
+        self.cur = self.conn.cursor()
+
+    def tearDown(self):
+        self.conn.close()
+        os.unlink(self.tmp.name)
+
+    def test_unique_rows(self):
+        self.cur.execute("SELECT COUNT(*) FROM skipped_affected WHERE cve_id='CVE-2004-0399'")
+        self.assertEqual(self.cur.fetchone()[0], 1)
+
+    def test_open_row_matches_any_version(self):
+        self.assertEqual(find_skipped(self.cur, "exim", parse_version("4.100.1")),
+                         {"CVE-2004-0399": "wildcard_beside_concrete_version"})
+
+    def test_bounds_and_exact_versions_still_apply(self):
+        self.assertEqual(find_skipped(self.cur, "http_server", parse_version("2.4.57")),
+                         {"CVE-2099-0001": "not_vulnerable"})
+        self.assertEqual(find_skipped(self.cur, "http_server", parse_version("2.2.15")),
+                         {"CVE-2011-2688": "not_vulnerable"})
+
+    def test_unknown_version_lists_nothing(self):
+        self.assertEqual(find_skipped(self.cur, "exim", parse_version(None)), {})
+
+    def test_database_without_the_table_lists_nothing(self):
+        conn = create_test_db()
+        try:
+            self.assertEqual(find_skipped(conn.cursor(), "exim", parse_version("4.100.1")), {})
+        finally:
+            conn.close()
+
+    def test_scan_service_reports_skipped_but_not_as_cves(self):
+        result = scan_service(self.cur, {"product": "exim", "version": "4.100.1"},
+                              aliases=None, maxcve=0)
+        self.assertEqual(result["cves"], [])
+        self.assertEqual(result["total_cves"], 0)
+        self.assertEqual(result["skipped_cves"], [
+            {"cve_id": "CVE-2004-0399", "reason": "wildcard_beside_concrete_version"}])
 
 
 class TestGetExploitInfo(unittest.TestCase):

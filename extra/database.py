@@ -222,6 +222,26 @@ class Database:
                 UNIQUE (cve_id, distro, release, package)
             );
 
+            -- CPEs applicable_cpes() left out, with why (SKIP_*). Never a
+            -- finding: cvescan reads it only to report what the old importer
+            -- would have matched, so a scan can log it. Bounds are '' rather
+            -- than NULL so the UNIQUE constraint holds across updates.
+            CREATE TABLE IF NOT EXISTS skipped_affected (
+                cve_id TEXT NOT NULL,
+                vendor TEXT NOT NULL,
+                product TEXT NOT NULL,
+                version TEXT NOT NULL,
+                version_update TEXT NOT NULL,
+                versionStartIncluding TEXT NOT NULL DEFAULT '',
+                versionStartExcluding TEXT NOT NULL DEFAULT '',
+                versionEndIncluding TEXT NOT NULL DEFAULT '',
+                versionEndExcluding TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL,
+                UNIQUE (cve_id, vendor, product, version, version_update,
+                        versionStartIncluding, versionStartExcluding,
+                        versionEndIncluding, versionEndExcluding)
+            );
+
             CREATE TABLE IF NOT EXISTS backport_metadata (
                 id INTEGER PRIMARY KEY,
                 ecosystem TEXT NOT NULL UNIQUE,
@@ -243,6 +263,8 @@ class Database:
                 ON affected(product_id);
             CREATE INDEX IF NOT EXISTS idx_multiaffected_product
                 ON multiaffected(product_id);
+            CREATE INDEX IF NOT EXISTS idx_skipped_affected_product
+                ON skipped_affected(product);
             CREATE INDEX IF NOT EXISTS idx_backports_cve
                 ON backports(cve_id);
             CREATE INDEX IF NOT EXISTS idx_backports_package_release
@@ -347,6 +369,14 @@ class Database:
         )
         self.conn.commit()
 
+    def insert_skipped(self, rows):
+        self.cursor.executemany(
+            "INSERT or IGNORE INTO skipped_affected "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        self.conn.commit()
+
     def insert_referenced(self, cves_exploits):
         self.cursor.executemany(
             "INSERT or IGNORE INTO referenced_exploit VALUES (?, ?)",
@@ -392,6 +422,9 @@ class Database:
         self.cursor.executemany("DELETE FROM affected WHERE cve_id = ?", cves)
         self.cursor.executemany(
             "DELETE FROM multiaffected WHERE cve_id = ?", cves
+        )
+        self.cursor.executemany(
+            "DELETE FROM skipped_affected WHERE cve_id = ?", cves
         )
         self.cursor.executemany("DELETE FROM cves WHERE cve_id = ?", cves)
         self.conn.commit()
@@ -977,6 +1010,77 @@ def parse_node(node):
     ]
 
 
+def _is_open_ended(version, tags):
+    """A wildcard version with no range: it matches every version."""
+    return version == "*" and all(t is None for t in tags)
+
+
+# Why classify_cpes() leaves an application CPE out (skipped_affected.reason).
+SKIP_NOT_VULNERABLE = "not_vulnerable"
+SKIP_NEGATED = "negated"
+SKIP_OPEN_IN_AND = "open_range_in_and_config"
+SKIP_WILDCARD_BESIDE_VERSION = "wildcard_beside_concrete_version"
+
+
+def applicable_cpes(configurations):
+    """Yield ((vendor, product, version, update), tags) for every application
+    CPE that a CVE's NVD configurations mark as vulnerable; see
+    classify_cpes for what is left out and why."""
+    for cpe, tags, skip in classify_cpes(configurations):
+        if skip is None:
+            yield cpe, tags
+
+
+def classify_cpes(configurations):
+    """Yield ((vendor, product, version, update), tags, skip) for every
+    application CPE of a CVE's NVD configurations. skip is None for a CPE
+    that is a finding, else the SKIP_* reason it is not.
+
+    Storing every CPE of a configuration, as this importer used to, turns
+    context into findings. Skipped:
+
+    - "vulnerable": false. NVD lists the platform a vulnerable add-on runs
+      on this way (CVE-2011-2688: mod_authnz_external on
+      apache:http_server:*), not a flaw in that platform.
+    - nodes with "negate": true. They name what must be absent.
+    - an open-ended CPE in an AND configuration. It is vulnerable only
+      together with a platform a remote scan cannot see (CVE-2008-3844:
+      OpenSSH AND RHEL 4/5), and its open end matches every version.
+    - an open-ended CPE when the same node names a concrete version of the
+      same product. That wildcard is noise (CVE-2004-0399 lists exim:* next
+      to exim:3.35 for a flaw in Exim 3.x only).
+
+    A bounded CPE in an AND configuration is kept: its range still limits
+    the match, and dropping it would lose "on Windows"-style findings.
+    """
+    for config in configurations:
+        in_and = config.get("operator") == "AND"
+        for node in config.get("nodes", []):
+            matches = [
+                (cpe, split(cpe["criteria"]),
+                 [_norm(cpe[vt]) if vt in cpe else None for vt in VTAGS])
+                for cpe in node["cpeMatch"]
+            ]
+            concrete = {
+                (ven, pro)
+                for _, (_, ven, pro, ver, _), _ in matches
+                if ver not in ("*", "-")
+            }
+            for cpe, (ptype, ven, pro, ver, vup), tags in matches:
+                if ptype != "a":
+                    continue
+                skip = None
+                if node.get("negate"):
+                    skip = SKIP_NEGATED
+                elif not cpe.get("vulnerable", True):
+                    skip = SKIP_NOT_VULNERABLE
+                elif _is_open_ended(ver, tags) and in_and:
+                    skip = SKIP_OPEN_IN_AND
+                elif _is_open_ended(ver, tags) and (ven, pro) in concrete:
+                    skip = SKIP_WILDCARD_BESIDE_VERSION
+                yield (ven, pro, ver, vup), tags, skip
+
+
 class PopulateDBThread(Thread):
     def __init__(self, path, finished, insert, queue):
         Thread.__init__(self)
@@ -996,6 +1100,7 @@ class PopulateDBThread(Thread):
             6: db.insert_multiaffected,
             7: db.insert_referenced,
             8: db.insert_referencedm,
+            9: db.insert_skipped,
         }
         self.datalist = {k: [] for k in self.execmany}
 
@@ -1120,39 +1225,24 @@ def query_api(args):
                 )
                 year = int(vuln["cve"]["published"][:4])
                 queue.put((1, (cve_id, cvssv2, cvssv3, year)))
-                if "configurations" in vuln["cve"]:
-                    for config in vuln["cve"]["configurations"]:
-                        for node in config["nodes"]:
-                            products = parse_node(node)
-                            for (
-                                ptype,
-                                ven,
-                                pro,
-                                ver,
-                                vup,
-                            ), tags in products:
-                                if ptype == "a":
-                                    queue.put((0, (ven, pro, ver, vup)))
-                                    if (
-                                        all(t is None for t in tags)
-                                        and ver != "*"
-                                    ):
-                                        queue.put(
-                                            (
-                                                5,
-                                                (
-                                                    cve_id,
-                                                    ven,
-                                                    pro,
-                                                    ver,
-                                                    vup,
-                                                ),
-                                            )
-                                        )
-                                    else:
-                                        queue.put(
-                                            (6, (cve_id, ven, pro, *tags))
-                                        )
+                configurations = vuln["cve"].get("configurations", [])
+                # Every application CPE stays in the product dictionary;
+                # only the ones applicable_cpes keeps become findings.
+                for config in configurations:
+                    for node in config["nodes"]:
+                        for (ptype, ven, pro, ver, vup), _ in parse_node(node):
+                            if ptype == "a":
+                                queue.put((0, (ven, pro, ver, vup)))
+                for (ven, pro, ver, vup), tags, skip in classify_cpes(
+                    configurations
+                ):
+                    if skip is not None:
+                        queue.put((9, (cve_id, ven, pro, ver, vup,
+                                       *(t or "" for t in tags), skip)))
+                    elif all(t is None for t in tags) and ver != "*":
+                        queue.put((5, (cve_id, ven, pro, ver, vup)))
+                    else:
+                        queue.put((6, (cve_id, ven, pro, *tags)))
                 if "references" in vuln["cve"]:
                     for reference in vuln["cve"]["references"]:
                         if "exploit-db" in reference["url"] and (
