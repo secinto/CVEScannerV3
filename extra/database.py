@@ -22,10 +22,13 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import argparse
+import hashlib
 import html
+import json
 import os
 import random
 import re
+import shutil
 import sqlite3 as sql
 import sys
 import time
@@ -135,6 +138,14 @@ class Database:
             CREATE TABLE IF NOT EXISTS metadata (
                 id INTEGER PRIMARY KEY,
                 last_mod TEXT
+            );
+
+            -- Build stamp: what this database was built from. Builders
+            -- compare it with their inputs and redo only the stale steps
+            -- (see BUILD_INFO_KEYS).
+            CREATE TABLE IF NOT EXISTS build_info (
+                key TEXT PRIMARY KEY,
+                value TEXT
             );
 
             CREATE TABLE IF NOT EXISTS exploits (
@@ -399,11 +410,22 @@ class Database:
         )
         self.conn.commit()
 
-    def update_metadata(self):
+    def update_metadata(self, last_mod=None):
         self.cursor.execute(
-            "INSERT or REPLACE INTO metadata VALUES (1, ?)", [now()]
+            "INSERT or REPLACE INTO metadata VALUES (1, ?)", [last_mod or now()]
         )
         self.conn.commit()
+
+    def set_build_info(self, **items):
+        self.cursor.executemany(
+            "INSERT or REPLACE INTO build_info (key, value) VALUES (?, ?)",
+            list(items.items()),
+        )
+        self.conn.commit()
+
+    def build_info(self):
+        self.cursor.execute("SELECT key, value FROM build_info")
+        return dict(self.cursor.fetchall())
 
     def update_exploits(self, exploits):
         self.cursor.executemany(
@@ -959,6 +981,10 @@ def load_curated_dispositions(db_path, path):
         return
     with open(path) as f:
         data = _json.load(f)
+    # Stamped even when nothing applies, so builders see the file is current.
+    with Database(db_path) as db:
+        db.setup()
+        db.set_build_info(curated_sha256=file_sha256(path))
 
     rows = []
     for e in data.get("dispositions", []):
@@ -1180,83 +1206,82 @@ def nvd_get_json(url, headers=None, timeout=120, max_retries=NVD_MAX_RETRIES):
     )
 
 
+def process_cpe_name(cpe_name, put):
+    """Queue one dictionary CPE as a product when it names an application."""
+    ptype, ven, pro, ver, vup = split(cpe_name)
+    if ptype == "a":
+        put(0, (ven, pro, ver, vup))
+
+
+def process_cve(cve, put, populate):
+    """Turn one NVD `cve` object into database rows.
+
+    `put(table_code, row)` receives every row; the codes are the ones
+    PopulateDBThread.setup_execm maps to insert methods. The NVD API path and
+    the raw cache path (populate_from_raw) both go through here, so a database
+    built from the cache matches one built from the API.
+    """
+    cve_id = cve["id"]
+    if cve["vulnStatus"].lower() in ("deferred", "rejected"):
+        if not populate:
+            put(2, (cve_id,))
+        return
+    metrics = cve.get("metrics", {})
+    cvssv2 = (
+        None
+        if "cvssMetricV2" not in metrics
+        else metrics["cvssMetricV2"][0]["cvssData"]["baseScore"]
+    )
+    cvssv3keys = [key for key in metrics.keys() if RE["v3"].match(key) is not None]
+    cvssv3 = (
+        None
+        if not cvssv3keys
+        else metrics[cvssv3keys[0]][0]["cvssData"]["baseScore"]
+    )
+    year = int(cve["published"][:4])
+    put(1, (cve_id, cvssv2, cvssv3, year))
+    configurations = cve.get("configurations", [])
+    # Every application CPE stays in the product dictionary;
+    # only the ones applicable_cpes keeps become findings.
+    for config in configurations:
+        for node in config["nodes"]:
+            for (ptype, ven, pro, ver, vup), _ in parse_node(node):
+                if ptype == "a":
+                    put(0, (ven, pro, ver, vup))
+    for (ven, pro, ver, vup), tags, skip in classify_cpes(configurations):
+        if skip is not None:
+            put(9, (cve_id, ven, pro, ver, vup, *(t or "" for t in tags), skip))
+        elif all(t is None for t in tags) and ver != "*":
+            put(5, (cve_id, ven, pro, ver, vup))
+        else:
+            put(6, (cve_id, ven, pro, *tags))
+    for reference in cve.get("references", []):
+        if "exploit-db" in reference["url"] and (
+            "tags" not in reference or "Broken Link" not in reference["tags"]
+        ):
+            match = RE["exp"].match(reference["url"])
+            if match is not None:
+                exp_id = match.group(1)
+                put(3, (exp_id,))
+                put(7, (cve_id, exp_id))
+
+
 @LIMITER.as_decorator(name="identity")
 def query_api(args):
     try:
         url, bar, thread_objs, batch, populate = args
         _, ev_ins, queue = thread_objs
+
+        def put(code, row):
+            queue.put((code, row))
+
         data = nvd_get_json(url, {"apiKey": KEY})
         if "cpes" in url:
-            idy = 0
             for prod in data["products"]:
-                ptype, ven, pro, ver, vup = split(prod["cpe"]["cpeName"])
-                idy += 1
-                if ptype == "a":
-                    queue.put((0, (ven, pro, ver, vup)))
+                process_cpe_name(prod["cpe"]["cpeName"], put)
         else:
             for vuln in data["vulnerabilities"]:
-                cve_id = vuln["cve"]["id"]
-                if vuln["cve"]["vulnStatus"].lower() in (
-                    "deferred",
-                    "rejected",
-                ):
-                    if not populate:
-                        #print(f"sending {cve_id} to remove")
-                        queue.put((2, (cve_id,)))
-                    continue
-                cvssv2 = (
-                    None
-                    if "cvssMetricV2" not in vuln["cve"]["metrics"]
-                    else vuln["cve"]["metrics"]["cvssMetricV2"][0]["cvssData"][
-                        "baseScore"
-                    ]
-                )
-                cvssv3keys = [
-                    key
-                    for key in vuln["cve"]["metrics"].keys()
-                    if RE["v3"].match(key) is not None
-                ]
-                cvssv3 = (
-                    None
-                    if not cvssv3keys
-                    else vuln["cve"]["metrics"][cvssv3keys[0]][0]["cvssData"][
-                        "baseScore"
-                    ]
-                )
-                year = int(vuln["cve"]["published"][:4])
-                queue.put((1, (cve_id, cvssv2, cvssv3, year)))
-                configurations = vuln["cve"].get("configurations", [])
-                # Every application CPE stays in the product dictionary;
-                # only the ones applicable_cpes keeps become findings.
-                for config in configurations:
-                    for node in config["nodes"]:
-                        for (ptype, ven, pro, ver, vup), _ in parse_node(node):
-                            if ptype == "a":
-                                queue.put((0, (ven, pro, ver, vup)))
-                for (ven, pro, ver, vup), tags, skip in classify_cpes(
-                    configurations
-                ):
-                    if skip is not None:
-                        queue.put((9, (cve_id, ven, pro, ver, vup,
-                                       *(t or "" for t in tags), skip)))
-                    elif all(t is None for t in tags) and ver != "*":
-                        queue.put((5, (cve_id, ven, pro, ver, vup)))
-                    else:
-                        queue.put((6, (cve_id, ven, pro, *tags)))
-                if "references" in vuln["cve"]:
-                    for reference in vuln["cve"]["references"]:
-                        if "exploit-db" in reference["url"] and (
-                            "tags" not in reference
-                            or (
-                                "tags" in reference
-                                and "Broken Link" not in reference["tags"]
-                            )
-                        ):
-                            match = RE["exp"].match(reference["url"])
-                            if match is not None:
-                                exp_id = match.group(1)
-                                queue.put((3, (exp_id,)))
-                                queue.put((7, (cve_id, exp_id)))
+                process_cve(vuln["cve"], put, populate)
     except Exception:
         # Retries inside nvd_get_json are exhausted: drop this batch rather than
         # abort the whole run. The caller's completeness check (ingested vs
@@ -1338,6 +1363,250 @@ def update_db(args, thread_objs, populate=False):
                     idx += CONST["cve"]
                 q_args[-1][-2] = cve_l  # last batch
                 tpe.map(query_api, q_args)
+
+
+# ── NVD raw cache ───────────────────────────────────────────────────────────
+# The NVD API is the slow part of a build: a full fetch takes about two hours.
+# The raw cache keeps every NVD `cve` object as fetched, so a change to the
+# import rules (classify_cpes, process_cve) rebuilds from disk in minutes, and
+# a scheduled update fetches only what NVD changed since the last run.
+#
+# A cache directory holds:
+#   cves.jsonl  one NVD `cve` object per line, the newest version of each CVE
+#               (deferred and rejected ones too, so a later status change wins)
+#   cpes.txt    one dictionary cpeName per line, sorted
+#   meta.json   last_mod (when the newest fetch started), full_fetch (when the
+#               last full fetch started), cves and cpes (line counts)
+# NVD accepts lastMod ranges of at most 120 days, so an older cache is
+# refetched in full.
+RAW_MAX_DELTA_DAYS = 110
+_RAW_ID = re.compile(r'^\{"id":"([^"]+)"')
+
+
+def read_raw_meta(raw_dir):
+    """The cache's meta.json as a dict, or None when there is no cache."""
+    path = Path(raw_dir) / "meta.json"
+    if not path.is_file():
+        return None
+    with path.open() as f:
+        return json.load(f)
+
+
+def raw_delta_window(meta, now_dt, full=False):
+    """The lastMod query suffix for a delta fetch, or "" for a full fetch."""
+    if full or not meta or not meta.get("last_mod"):
+        return ""
+    last = datetime.fromisoformat(meta["last_mod"])
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    if (now_dt - last).days > RAW_MAX_DELTA_DAYS:
+        return ""
+    return (f"&lastModStartDate={_urlquote(last.isoformat())}"
+            f"&lastModEndDate={_urlquote(now_dt.isoformat())}")
+
+
+def _raw_cve_id(line):
+    match = _RAW_ID.match(line)
+    return match.group(1) if match else json.loads(line)["id"]
+
+
+@LIMITER.as_decorator(name="identity")
+def _fetch_raw_page(job):
+    """Fetch one NVD page and write it to the job's file (atomically)."""
+    url, kind, out = job
+    data = nvd_get_json(url, {"apiKey": KEY})
+    tmp = out.with_name(out.name + ".tmp")
+    with tmp.open("w") as f:
+        if kind == "cpes":
+            for prod in data["products"]:
+                f.write(prod["cpe"]["cpeName"] + "\n")
+        else:
+            for vuln in data["vulnerabilities"]:
+                f.write(json.dumps(vuln["cve"], separators=(",", ":")) + "\n")
+    tmp.replace(out)
+
+
+def _fetch_raw_pages(jobs, kind):
+    """Fetch every page; retry failed ones once more, then fail the refresh.
+
+    Unlike query_api, a page is never dropped: a cache with a hole would
+    silently lose CVEs from every database built from it.
+    """
+    failed = []
+    with tqdm(total=len(jobs), ascii=" =", desc=f"[+] Fetching {kind} pages") as bar:
+        with ThreadPoolExecutor() as tpe:
+            futures = {tpe.submit(_fetch_raw_page, job): job for job in jobs}
+            for future, job in futures.items():
+                try:
+                    future.result()
+                except Exception as exc:
+                    print(f"[!] {kind} page failed, will retry: {job[0]} ({exc})")
+                    failed.append(job)
+                bar.update()
+    for job in failed:
+        try:
+            _fetch_raw_page(job)
+        except Exception as exc:
+            raise DatabaseUpdateError(
+                f"NVD raw fetch incomplete, {kind} page failed twice: {job[0]}"
+            ) from exc
+
+
+def merge_raw(raw_dir, delta_dir, full=False):
+    """Merge fetched pages into cves.jsonl and cpes.txt; return the counts.
+
+    Streams the old cves.jsonl and replaces each CVE the delta holds, so only
+    the delta is kept in memory. With full=True the old files are dropped.
+    """
+    raw_dir, delta_dir = Path(raw_dir), Path(delta_dir)
+    newest = {}
+    for path in sorted(delta_dir.glob("cves_*")):
+        with path.open() as f:
+            for line in f:
+                cve = json.loads(line)
+                held = newest.get(cve["id"])
+                if held is None or cve.get("lastModified", "") >= held[0]:
+                    newest[cve["id"]] = (cve.get("lastModified", ""), line)
+
+    cves_path = raw_dir / "cves.jsonl"
+    tmp = raw_dir / "cves.jsonl.tmp"
+    count = 0
+    with tmp.open("w") as out:
+        if not full and cves_path.is_file():
+            with cves_path.open() as f:
+                for line in f:
+                    if _raw_cve_id(line) not in newest:
+                        out.write(line)
+                        count += 1
+        for _, line in newest.values():
+            out.write(line)
+            count += 1
+    tmp.replace(cves_path)
+
+    cpes_path = raw_dir / "cpes.txt"
+    cpes = set()
+    sources = sorted(delta_dir.glob("cpes_*"))
+    if not full and cpes_path.is_file():
+        sources.insert(0, cpes_path)
+    for path in sources:
+        with path.open() as f:
+            cpes.update(line.strip() for line in f)
+    cpes.discard("")
+    tmp = raw_dir / "cpes.txt.tmp"
+    with tmp.open("w") as out:
+        out.writelines(f"{cpe}\n" for cpe in sorted(cpes))
+    tmp.replace(cpes_path)
+    return {"cves": count, "cpes": len(cpes)}
+
+
+def refresh_raw(raw_dir, full=False):
+    """Bring the raw cache up to date with NVD; return the new meta.
+
+    Fetches only the records NVD changed since meta.last_mod, or everything
+    when there is no cache, it is too old for a delta, or full=True. last_mod
+    is the time the fetch STARTED, so a record changed during the fetch is
+    fetched again next time rather than missed.
+    """
+    raw_dir = Path(raw_dir)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    meta = read_raw_meta(raw_dir)
+    started = datetime.now(timezone.utc)
+    window = raw_delta_window(meta, started, full)
+    if window:
+        print(f"[*] Raw cache delta since {meta['last_mod']}")
+    else:
+        print("[*] Raw cache full fetch")
+    delta = raw_dir / "delta"
+    shutil.rmtree(delta, ignore_errors=True)
+    delta.mkdir()
+    for kind in ("cpes", "cves"):
+        total = nvd_get_json(
+            f"{URL['nvd'].format(kind, 0)}&resultsPerPage=1{window}"
+        )["totalResults"]
+        print(f"[+] Metadata: {total} {kind.upper()}")
+        per_page = CONST[kind[:-1]]
+        jobs = [
+            (f"{URL['nvd'].format(kind, idx)}{window}", kind,
+             delta / f"{kind}_{idx:09d}")
+            for idx in range(0, total, per_page)
+        ]
+        _fetch_raw_pages(jobs, kind)
+    counts = merge_raw(raw_dir, delta, full=not window)
+    shutil.rmtree(delta)
+    meta = dict(meta or {})
+    meta.update(counts, last_mod=started.isoformat())
+    if not window:
+        meta["full_fetch"] = started.isoformat()
+    tmp = raw_dir / "meta.json.tmp"
+    with tmp.open("w") as f:
+        json.dump(meta, f, indent=1)
+    tmp.replace(raw_dir / "meta.json")
+    print(f"[+] Raw cache: {counts['cves']} CVEs, {counts['cpes']} CPEs")
+    return meta
+
+
+class _BatchSink:
+    """Collects rows per table code and writes them in batches.
+
+    populate_from_raw produces rows far faster than the NVD API, so it writes
+    directly instead of through PopulateDBThread, whose queue only drains
+    when the producer pauses.
+    """
+
+    def __init__(self, db, size=50000):
+        self.size = size
+        self.write = {
+            0: db.insert_products,
+            1: db.insert_cves,
+            3: db.insert_exploits,
+            5: db.insert_affected,
+            6: db.insert_multiaffected,
+            7: db.insert_referenced,
+            9: db.insert_skipped,
+        }
+        self.rows = {code: [] for code in self.write}
+
+    def put(self, code, row):
+        self.rows[code].append(row)
+        if len(self.rows[code]) >= self.size:
+            self.flush()
+
+    def flush(self):
+        # Every table, in code order: affected and multiaffected look up
+        # product_id in products, so products must be written first.
+        for code in sorted(self.write):
+            if self.rows[code]:
+                self.write[code](self.rows[code])
+                self.rows[code] = []
+
+
+def populate_from_raw(database, raw_dir):
+    """Build the NVD part of a new database from the raw cache, offline.
+
+    Replaces `database`. metadata.last_mod becomes the cache's last_mod, so
+    a later incremental API update continues from the right point.
+    """
+    meta = read_raw_meta(raw_dir)
+    if not meta:
+        raise DatabaseUpdateError(f"No NVD raw cache at {raw_dir} (meta.json missing)")
+    raw_dir, database = Path(raw_dir), Path(database)
+    if database.exists():
+        database.unlink()
+    with Database(database) as db:
+        db.setup()
+        sink = _BatchSink(db)
+        with (raw_dir / "cpes.txt").open() as f:
+            for line in tqdm(f, total=meta.get("cpes"), ascii=" =",
+                             desc="[+] Importing CPEs"):
+                if line.strip():
+                    process_cpe_name(line.strip(), sink.put)
+        with (raw_dir / "cves.jsonl").open() as f:
+            for line in tqdm(f, total=meta.get("cves"), ascii=" =",
+                             desc="[+] Importing CVEs"):
+                process_cve(json.loads(line), sink.put, populate=True)
+        sink.flush()
+        db.update_metadata(meta["last_mod"])
+    return meta
 
 
 def update_metasploit(args, thread_objs):
@@ -1425,12 +1694,106 @@ def update_exploitdb(args):
                             bar.update()
 
 
+# ── Build stamp ─────────────────────────────────────────────────────────────
+# Keys in the build_info table. Builders (CVEScannerV3DB's workflow and
+# checkfix_tools_monorepo's build-cve-db.sh) compare them with their own
+# inputs and redo only the step whose input changed.
+#   importer_sha256   sha256 of this file when the NVD part was built
+#   nvd_source        "api" or "raw-cache"
+#   nvd_built_at      when the NVD part was built
+#   backports_config  backports_config_key() of the last backports refresh
+#   backports_at      when the backports were last refreshed
+#   curated_sha256    sha256 of the curated overlay file last applied
+BUILD_INFO_KEYS = (
+    "importer_sha256", "nvd_source", "nvd_built_at", "backports_config",
+    "backports_at", "curated_sha256",
+)
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def importer_sha256():
+    return file_sha256(__file__)
+
+
+def backports_config_key(ecosystems=None, redhat=False, redhat_packages=(),
+                         redhat_releases=(), ubuntu=False, ubuntu_packages=(),
+                         ubuntu_releases=()):
+    """Canonical text of the backport inputs.
+
+    build-cve-db.sh builds the same text in shell: every list sorted and
+    comma-joined, a disabled source as "-".
+    """
+    def source(enabled, packages, releases):
+        if not enabled:
+            return "-"
+        return f"{','.join(sorted(packages))}@{','.join(sorted(releases))}"
+
+    return (f"osv={','.join(sorted(ecosystems or DEFAULT_ECOSYSTEMS))}"
+            f"|redhat={source(redhat, redhat_packages, redhat_releases)}"
+            f"|ubuntu={source(ubuntu, ubuntu_packages, ubuntu_releases)}")
+
+
+def _stamp_nvd(database, source):
+    with Database(database) as db:
+        db.set_build_info(importer_sha256=importer_sha256(), nvd_source=source,
+                          nvd_built_at=now())
+
+
+def _run_backports(database, ecosystems, redhat, redhat_packages,
+                   redhat_releases, ubuntu, ubuntu_packages, ubuntu_releases,
+                   curated_path):
+    update_backports_osv(database, ecosystems=ecosystems)
+    if redhat:
+        update_backports_redhat(database, releases=redhat_releases,
+                                packages=redhat_packages)
+    if ubuntu:
+        update_backports_ubuntu(database, releases=ubuntu_releases,
+                                packages=ubuntu_packages)
+    with Database(database) as db:
+        db.set_build_info(
+            backports_config=backports_config_key(
+                ecosystems, redhat, redhat_packages, redhat_releases,
+                ubuntu, ubuntu_packages, ubuntu_releases),
+            backports_at=now(),
+        )
+    if curated_path:
+        load_curated_dispositions(database, curated_path)
+
+
+def _update_exploits(database, noscrape):
+    """Metasploit references and exploit-db names, for a database built from
+    the raw cache (the API path does this inside its own populate thread)."""
+    class _Args:
+        pass
+    args = _Args()
+    args.database = database
+    args.noscrape = noscrape
+    thread_objs = (Event(), Event(), Queue())
+    thread = PopulateDBThread(database, *thread_objs)
+    thread.start()
+    try:
+        update_metasploit(args, thread_objs)
+        update_exploitdb(args)
+    finally:
+        thread_objs[0].set()
+        thread.join()
+
+
 def run_update(database, api_key, noscrape=False, full=False,
                backports=False, backports_only=False, ecosystems=None,
                redhat=False, redhat_packages=("openssh",),
                redhat_releases=("8", "9"), curated_path=None,
                ubuntu=False, ubuntu_packages=("openssh",),
-               ubuntu_releases=("24.04", "22.04", "20.04")):
+               ubuntu_releases=("24.04", "22.04", "20.04"),
+               raw_dir=None, refresh_raw_cache=False, from_raw=False,
+               curated_only=False, skip_exploits=False):
     """Run the database create/update process.
 
     Args:
@@ -1441,6 +1804,14 @@ def run_update(database, api_key, noscrape=False, full=False,
         backports: If True, also fetch OSV backport data after NVD update.
         backports_only: If True, skip NVD update, only fetch backport data.
         ecosystems: List of OSV ecosystem strings to fetch (e.g. ["Debian:12"]).
+        raw_dir: NVD raw cache directory (see refresh_raw).
+        refresh_raw_cache: Bring raw_dir up to date with NVD first. Without
+            from_raw, nothing else happens.
+        from_raw: Build the NVD part from raw_dir instead of the API. Always
+            a new database.
+        curated_only: Only apply the curated overlay to an existing database.
+        skip_exploits: With from_raw, skip Metasploit and exploit-db (for
+            comparing import rules offline).
 
     Raises:
         DatabaseUpdateError: On any failure during the update process.
@@ -1450,21 +1821,38 @@ def run_update(database, api_key, noscrape=False, full=False,
 
     database = Path(database)
 
+    backport_args = (ecosystems, redhat, redhat_packages, redhat_releases,
+                     ubuntu, ubuntu_packages, ubuntu_releases, curated_path)
+
+    if curated_only:
+        if not curated_path:
+            raise DatabaseUpdateError("--curated-only needs --curated")
+        load_curated_dispositions(database, curated_path)
+        return
+
     if backports_only:
         # Only update backport data, skip NVD
         print(COPYRIGHT)
         # Ensure tables exist
         with Database(database) as db:
             db.setup()
-        update_backports_osv(database, ecosystems=ecosystems)
-        if redhat:
-            update_backports_redhat(database, releases=redhat_releases,
-                                    packages=redhat_packages)
-        if ubuntu:
-            update_backports_ubuntu(database, releases=ubuntu_releases,
-                                    packages=ubuntu_packages)
-        if curated_path:
-            load_curated_dispositions(database, curated_path)
+        _run_backports(database, *backport_args)
+        return
+
+    if refresh_raw_cache or from_raw:
+        if not raw_dir:
+            raise DatabaseUpdateError("--refresh-raw and --from-raw need --raw-dir")
+        print(COPYRIGHT)
+        if refresh_raw_cache:
+            refresh_raw(raw_dir, full=full)
+        if not from_raw:
+            return
+        populate_from_raw(database, raw_dir)
+        _stamp_nvd(database, "raw-cache")
+        if not skip_exploits:
+            _update_exploits(database, noscrape)
+        if backports:
+            _run_backports(database, *backport_args)
         return
 
     if full and database.is_file():
@@ -1489,6 +1877,7 @@ def run_update(database, api_key, noscrape=False, full=False,
 
         with Database(database) as db:
             db.update_metadata()
+        _stamp_nvd(database, "api")
 
         update_metasploit(args, thread_objs)
         update_exploitdb(args)
@@ -1499,15 +1888,7 @@ def run_update(database, api_key, noscrape=False, full=False,
             bar.update()
 
     if backports:
-        update_backports_osv(database, ecosystems=ecosystems)
-        if redhat:
-            update_backports_redhat(database, releases=redhat_releases,
-                                    packages=redhat_packages)
-        if ubuntu:
-            update_backports_ubuntu(database, releases=ubuntu_releases,
-                                    packages=ubuntu_packages)
-        if curated_path:
-            load_curated_dispositions(database, curated_path)
+        _run_backports(database, *backport_args)
 
 
 if __name__ == "__main__":
@@ -1577,6 +1958,39 @@ if __name__ == "__main__":
         "--curated",
         help="Path to a curated disposition overlay JSON (highest precedence)",
     )
+    parser.add_argument(
+        "--curated-only",
+        action="store_true",
+        help="Only apply --curated to the existing database (no network)",
+    )
+    parser.add_argument(
+        "--raw-dir",
+        type=Path,
+        help="NVD raw cache directory (cves.jsonl, cpes.txt, meta.json)",
+    )
+    parser.add_argument(
+        "--refresh-raw",
+        action="store_true",
+        help="Fetch what NVD changed since the cache's last_mod into --raw-dir "
+             "(everything when there is no cache or it is over "
+             f"{RAW_MAX_DELTA_DAYS} days old)",
+    )
+    parser.add_argument(
+        "--from-raw",
+        action="store_true",
+        help="Build a new database from --raw-dir instead of the NVD API",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Start from scratch: delete the database, or refetch the whole "
+             "raw cache with --refresh-raw",
+    )
+    parser.add_argument(
+        "--skip-exploits",
+        action="store_true",
+        help="With --from-raw: skip Metasploit and exploit-db (offline)",
+    )
     args = parser.parse_args()
 
     ecosystems = None
@@ -1594,7 +2008,9 @@ if __name__ == "__main__":
             api_key = f.read().strip()
     else:
         api_key = os.getenv("NVD_KEY")
-        if api_key is None and not args.backports_only:
+        needs_nvd = not (args.backports_only or args.curated_only
+                         or (args.from_raw and not args.refresh_raw))
+        if api_key is None and needs_nvd:
             print(
                 "[!] NVD API key required in order to retrieve data. "
                 "Check README.md for more information"
@@ -1618,6 +2034,12 @@ if __name__ == "__main__":
             ubuntu_packages=ubuntu_packages,
             ubuntu_releases=ubuntu_releases,
             curated_path=args.curated,
+            raw_dir=args.raw_dir,
+            refresh_raw_cache=args.refresh_raw,
+            from_raw=args.from_raw,
+            curated_only=args.curated_only,
+            skip_exploits=args.skip_exploits,
+            full=args.full,
         )
     except DatabaseUpdateError as e:
         print(f"[!] {e}")

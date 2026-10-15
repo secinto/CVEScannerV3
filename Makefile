@@ -1,4 +1,4 @@
-.PHONY: test lint clean install-deps docker bump-version release-notes tag release release-draft bump-and-release _check-changes version help
+.PHONY: test lint compare-rules clean install-deps docker bump-version release-notes tag release release-draft bump-and-release _check-changes version help
 .DEFAULT_GOAL := help
 
 # Variables
@@ -37,6 +37,12 @@ lint:
 		(which flake8 > /dev/null 2>&1 && flake8 $(PYTHON_DIR)/*.py) || \
 		echo "No linter found. Install ruff: pip install ruff"
 	@echo "Lint complete"
+
+# Compare the import rules of BASE (default origin/master) with the working
+# tree: both databases are built from the NVD raw cache, then diffed per
+# product. ARGS go to extra/compare_rules.py, e.g. ARGS="--product exim".
+compare-rules:
+	@BASE="$(BASE)" PYTHON="$(PYTHON)" bash scripts/compare-rules.sh $(ARGS)
 
 # Remove Python cache files and build artifacts
 clean:
@@ -177,6 +183,7 @@ help:
 	@echo "  make install-deps     - Install Python dependencies from extra/requirements.txt"
 	@echo "  make test             - Run Python unit tests"
 	@echo "  make lint             - Run linter on Python files (ruff or flake8)"
+	@echo "  make compare-rules    - Diff import rules of BASE (default origin/master) vs working tree from the NVD raw cache"
 	@echo "  make clean            - Remove Python cache files"
 	@echo "  make docker           - Build Docker image"
 	@echo "  make version          - Show version information"
