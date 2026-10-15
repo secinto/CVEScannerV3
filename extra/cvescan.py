@@ -966,6 +966,10 @@ def annotate_confidence(cve_list, distro, distro_release, backport_results,
             active.append(cve)
         elif bp_status == "affected":
             cve["confidence"] = "UPSTREAM_MATCH"
+            # The installed package is older than the vendor's fix: the fixed
+            # version tells the customer which update closes the CVE.
+            if fixed_version:
+                cve["fixed_version"] = fixed_version
             active.append(cve)
         else:
             # unknown — no backport data
