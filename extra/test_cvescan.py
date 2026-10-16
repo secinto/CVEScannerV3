@@ -2239,6 +2239,17 @@ class TestAnnotateConfidence(unittest.TestCase):
         self.assertEqual(patched[0]["cve_id"], "CVE-1")
         self.assertEqual(patched[0]["confidence"], "LIKELY_PATCHED")
         self.assertEqual(patched[0]["fixed_version"], "1.0-1")
+        self.assertNotIn("fixed_version", active[0])
+
+    def test_affected_keeps_fixed_version(self):
+        """An installed package older than the fix stays active and names the fix."""
+        cves = [{"cve_id": "CVE-1", "cvss_v3": 8.0, "cvss_v2": None}]
+        bp = {"CVE-1": {"status": "affected", "disposition": "affected",
+                        "fixed_version": "1:9.6p1-3ubuntu13.18"}}
+        active, patched = annotate_confidence(cves, "ubuntu", "noble", bp)
+        self.assertEqual(len(patched), 0)
+        self.assertEqual(active[0]["confidence"], "UPSTREAM_MATCH")
+        self.assertEqual(active[0]["fixed_version"], "1:9.6p1-3ubuntu13.18")
 
     def test_uncertain(self):
         """Unknown backport status should result in UNCERTAIN."""
