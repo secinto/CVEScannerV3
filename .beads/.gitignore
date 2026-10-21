@@ -78,3 +78,7 @@ bd.db
 
 # bd audit log: append-only per host, conflicts on every merge; Dolt history carries the same events
 interactions.jsonl
+
+# Added by bd (missing required patterns)
+*.gate.lock*
+dolt-server-config.yaml
