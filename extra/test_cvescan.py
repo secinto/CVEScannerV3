@@ -1285,14 +1285,69 @@ class TestDistroDetection(unittest.TestCase):
         self.assertIsNone(info)
 
     def test_bare_banner(self):
+        # A bare stock version resolves the release (cvescannerv3-2e0): each
+        # live release pins exactly one upstream version, and the stock maps
+        # exclude every version two releases shipped.
         info = detect_distro_from_banner("OpenSSH_9.2p1")
-        self.assertIsNone(info)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["distro"], "debian")
+        self.assertEqual(info["distro_release"], "bookworm")
+        self.assertIsNone(info["package_revision"])
+        self.assertTrue(info["bare_stock"])
 
-    def test_bare_banner_not_resolved_by_stock_version(self):
-        # 9.2p1 is Bookworm's stock OpenSSH, but a stripped banner (DebianBanner
-        # no) carries no package revision — inferring a release here would
-        # assert a patch level the host never disclosed.
-        self.assertIsNone(detect_distro_from_banner("OpenSSH_9.2p1 protocol 2.0"))
+    def test_bare_banner_ubuntu_stock(self):
+        # 7.6p1 is Ubuntu 18.04's frozen version (knowledgeriver.com).
+        info = detect_distro_from_banner("OpenSSH_7.6p1 protocol 2.0")
+        self.assertEqual(info["distro"], "ubuntu")
+        self.assertEqual(info["distro_release"], "bionic")
+        self.assertTrue(info["bare_stock"])
+
+    def test_bare_banner_family_word_restricts_stock_maps(self):
+        # nmap synthesizes "OpenSSH_<ver> <extrainfo>". The extrainfo names the
+        # OS family: it must not be contradicted by another distro's stock
+        # version. 9.2p1 is Debian's stock version, not Ubuntu's — the banner
+        # stays unresolved instead of asserting a Debian release.
+        self.assertIsNone(
+            detect_distro_from_banner("OpenSSH_9.2p1 Ubuntu Linux; protocol 2.0"))
+
+    def test_bare_banner_family_word_confirms(self):
+        # The family word can also narrow a genuinely ambiguous case.
+        info = detect_distro_from_banner("OpenSSH_9.2p1 Debian Linux; protocol 2.0")
+        self.assertEqual(info["distro"], "debian")
+        self.assertEqual(info["distro_release"], "bookworm")
+
+    def test_bare_banner_non_stock_version(self):
+        # 9.4p1 is no live release's stock version — a self-compiled build.
+        self.assertIsNone(detect_distro_from_banner("OpenSSH_9.4p1 protocol 2.0"))
+
+    def test_bare_ssh_banner_rhel_still_wins(self):
+        # el banners carry no "pN" suffix; the RHEL frozen-version path must
+        # keep precedence over the Debian/Ubuntu stock lookup.
+        info = detect_distro_from_banner("OpenSSH_8.0")
+        self.assertEqual(info["distro"], "rhel")
+        self.assertEqual(info["distro_release"], "8")
+        self.assertNotIn("bare_stock", info)
+
+    def test_bind_banner_el8(self):
+        # 9.11.36 is el8's frozen BIND version (sommerimpulse.at).
+        for banner in ("BIND 9.11.36",
+                       "BIND 9.11.36-RedHat-9.11.36-16.el8_9.1",
+                       "ISC BIND 9.11.36 (Red Hat Enterprise Linux)"):
+            info = detect_distro_from_banner(banner)
+            self.assertIsNotNone(info, banner)
+            self.assertEqual(info["distro"], "rhel", banner)
+            self.assertEqual(info["distro_release"], "8", banner)
+
+    def test_bind_banner_el9(self):
+        info = detect_distro_from_banner("BIND 9.16.23")
+        self.assertEqual(info["distro"], "rhel")
+        self.assertEqual(info["distro_release"], "9")
+
+    def test_bind_banner_unmapped_version_stays_unresolved(self):
+        # 9.18.x is Debian's AND Ubuntu's series (bookworm/jammy/noble), and
+        # distros rebase BIND within the series — deliberately unmapped.
+        self.assertIsNone(detect_distro_from_banner("BIND 9.18.28"))
+        self.assertIsNone(detect_distro_from_banner("BIND 9.11.19"))
 
     def test_empty_banner(self):
         self.assertIsNone(detect_distro_from_banner(""))
@@ -1318,6 +1373,17 @@ class TestPatchConfidence(unittest.TestCase):
         self.assertEqual(
             classify_patch_confidence(None, "9.2p1"), PATCH_LEVEL_UNKNOWN)
 
+    def test_bare_stock_banner_is_unknown_but_says_which_release(self):
+        # The bare banner now resolves the release (cvescannerv3-2e0), so the
+        # assessment names the release it resolved instead of listing every
+        # candidate — but the confidence stays unknown: no revision disclosed.
+        hint = detect_distro_from_banner("OpenSSH_9.2p1 protocol 2.0")
+        a = explain_patch_confidence(hint, "9.2p1")
+        self.assertEqual(a.confidence, PATCH_LEVEL_UNKNOWN)
+        self.assertEqual(a.reason, REASON_STOCK_VERSION_BARE_BANNER)
+        self.assertEqual(a.distro, "debian")
+        self.assertEqual(a.candidates, ["debian:bookworm"])
+
     def test_os_tag_without_revision_is_unknown(self):
         hint = detect_distro_from_banner("Apache/2.4.57 (Debian)")
         self.assertEqual(
@@ -1327,6 +1393,12 @@ class TestPatchConfidence(unittest.TestCase):
         # 9.4p1 is no distro's stock OpenSSH — a self-compiled build, where
         # upstream range matching means exactly what it says.
         self.assertEqual(classify_patch_confidence(None, "9.4p1"), PATCH_UPSTREAM)
+
+    def test_bind_banner_el_release_is_confirmed(self):
+        # el BIND works like el OpenSSH: frozen version, RPM release bumps.
+        hint = detect_distro_from_banner("BIND 9.11.36")
+        self.assertEqual(classify_patch_confidence(hint, "9.11.36"),
+                         PATCH_CONFIRMED)
 
     def test_no_version_is_upstream(self):
         self.assertEqual(classify_patch_confidence(None, None), PATCH_UPSTREAM)
@@ -2701,6 +2773,38 @@ class TestNvdCorpus(unittest.TestCase):
                              f"expected {case['expect']}, got {got}")
         self.assertGreater(len(self.cases), 600)
         self.assertEqual(wrong, [], f"{len(wrong)} of {len(self.cases)} cases")
+
+
+class TestSynthesizedBanner(unittest.TestCase):
+    """nmap_to_services._synthesized_banner shapes (cvescannerv3-2e0)."""
+
+    def _svc(self, **kw):
+        from nmap_to_services import _synthesized_banner
+        return _synthesized_banner({**kw})
+
+    def test_ssh_carries_distro_tag(self):
+        self.assertEqual(
+            self._svc(name="ssh", product="OpenSSH", version="9.6p1",
+                      extrainfo="Ubuntu 3ubuntu13.16; protocol 2.0"),
+            "OpenSSH_9.6p1 Ubuntu 3ubuntu13.16; protocol 2.0")
+
+    def test_ssh_without_version_has_no_banner(self):
+        self.assertEqual(
+            self._svc(name="ssh", product="OpenSSH", extrainfo="protocol 2.0"),
+            "")
+
+    def test_bind_generic_shape(self):
+        self.assertEqual(
+            self._svc(name="domain", product="ISC BIND", version="9.11.36",
+                      extrainfo="(Red Hat Enterprise Linux)"),
+            "ISC BIND 9.11.36 (Red Hat Enterprise Linux)")
+
+    def test_http_shape(self):
+        self.assertEqual(
+            self._svc(name="http", product="Apache httpd", version="2.4.37",
+                      extrainfo="(Red Hat Enterprise Linux)",
+                      tunnel="ssl"),
+            "Apache httpd/2.4.37 (Red Hat Enterprise Linux)")
 
 
 if __name__ == "__main__":

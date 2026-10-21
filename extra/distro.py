@@ -88,6 +88,30 @@ RHEL_HTTPD_RELEASES = {
     "2.4.37": "8",
 }
 
+# RHEL family also freezes BIND per major: el8 shipped bind-9.11.36-*.el8 and
+# el9 bind-9.16.23-*.el9, with fixes shipped as RPM release bumps only. No
+# Debian or Ubuntu release carries either version as a stock package
+# (buster 9.11.5.P1, bullseye 9.11.19, bionic 9.11.3, focal 9.16.1, jammy
+# 9.18.1), so the BIND version is a collision-free el discriminator — the
+# same frozen-version argument the bare OpenSSH banner makes. Unlike OpenSSH,
+# Debian/Ubuntu rebase BIND inside a series and their 9.18 series is shared
+# by bookworm, jammy and noble — a bare "9.18.x" resolves no codename and is
+# deliberately unmapped (cvescannerv3-2e0).
+RHEL_BIND_RELEASES = {
+    "9.11.36": "8",
+    "9.16.23": "9",
+}
+
+# Portable OpenSSH version, with the "pN" suffix Debian/Ubuntu always carry:
+# "6.6.1p1", "7.2p2", "9.2p1". (_RE_BARE_SSH above stops at "\d+.\d+" — the
+# el versions are maj.min — so it cannot read "6.6.1p1" back.)
+_RE_PORTABLE_SSH = re.compile(r"OpenSSH_([\d.]+p\d+)(.*)$", re.IGNORECASE)
+
+# BIND version in a CHAOS version.bind response ("BIND 9.11.36-RedHat-...")
+# or a synthesized product banner ("ISC BIND 9.11.36"). Only the leading
+# dotted-numeric version is read; distro markers further right are not.
+_RE_BIND = re.compile(r"\bBIND\s+(\d+\.\d+\.\d+)", re.IGNORECASE)
+
 # Map (distro, codename) → OSV ecosystem string
 RELEASE_TO_OSV = {
     # RHEL family: AlmaLinux is the OSV proxy bucket. CloudLinux/Rocky/CentOS
@@ -217,6 +241,15 @@ def detect_rhel_httpd_release(httpd_version):
     return RHEL_HTTPD_RELEASES.get(httpd_version)
 
 
+def detect_rhel_bind_release(bind_version):
+    """Map a frozen BIND version to a RHEL/el major release.
+
+    E.g. '9.11.36' → '8'. Returns None for versions that are not a unique,
+    frozen-for-life el identifier — see RHEL_BIND_RELEASES.
+    """
+    return RHEL_BIND_RELEASES.get(bind_version)
+
+
 def detect_distro_from_banner(banner):
     """Parse a service banner to detect distro information.
 
@@ -266,6 +299,54 @@ def detect_distro_from_banner(banner):
                     "distro_release": el_major,
                     "package_revision": None,
                 }
+
+    # Bare portable SSH banner: "OpenSSH_9.2p1" with the "pN" suffix and no
+    # distro tag (DebianBanner no). Each live Debian/Ubuntu release pins
+    # exactly one upstream OpenSSH version for its lifetime, and the stock
+    # maps deliberately exclude every version more than one release shipped
+    # (9.0p1: kinetic and lunar) — so a bare stock version resolves the
+    # release, the same frozen-version argument the bare el banner above
+    # makes. The banner still discloses no package revision, so this asserts
+    # a distro, never a patch level: the hint carries no revision and the
+    # confidence stays patch-level-unknown (cvescannerv3-2e0).
+    m = _RE_PORTABLE_SSH.search(banner)
+    if m:
+        ssh_version, tail = m.group(1), m.group(2) or ""
+        # A family word in the tail (nmap's extrainfo "Ubuntu Linux; ...")
+        # restricts which stock maps may answer: "OpenSSH_9.2p1 Ubuntu Linux"
+        # must not resolve to Debian's stock 9.2p1. No family word means no
+        # restriction.
+        want_ubuntu = bool(re.search(r"Ubuntu", tail, re.IGNORECASE))
+        want_debian = bool(re.search(r"Debian", tail, re.IGNORECASE))
+        stock = matches_distro_stock_version(ssh_version)
+        if want_ubuntu or want_debian:
+            stock = [(d, c) for d, c in stock
+                     if (d == "ubuntu" and want_ubuntu)
+                     or (d == "debian" and want_debian)]
+        if len(stock) == 1:
+            distro, codename = stock[0]
+            return {
+                "distro": distro,
+                "distro_release": codename,
+                "package_revision": None,
+                "bare_stock": True,
+            }
+
+    # Bare BIND banner: "BIND 9.11.36" — the CHAOS version.bind response, or
+    # the product/version banner the pipelines synthesize. A frozen-for-life
+    # el BIND version resolves the el major the way the bare OpenSSH banner
+    # above does. This check precedes the RHEL HTTP branch so a banner that
+    # carries both a BIND version and an el-family Server tag resolves the
+    # major from the version instead of stopping at rhel + no release.
+    bm = _RE_BIND.search(banner)
+    if bm:
+        el_major = detect_rhel_bind_release(bm.group(1))
+        if el_major:
+            return {
+                "distro": "rhel",
+                "distro_release": el_major,
+                "package_revision": None,
+            }
 
     # RHEL-family HTTP banner: Apache/2.4.37 (Red Hat Enterprise Linux),
     # ... (CentOS) / (CloudLinux) / (AlmaLinux) / (Rocky Linux) / (Oracle Linux).
@@ -485,6 +566,13 @@ def explain_patch_confidence(hint, version=None):
                 return PatchAssessment(PATCH_CONFIRMED, "", distro, [])
             return PatchAssessment(
                 PATCH_LEVEL_UNKNOWN, REASON_EL_RELEASE_UNRESOLVED, distro, [])
+        if hint.get("bare_stock"):
+            # A bare stock version resolved the release (DebianBanner no). The
+            # distro is well evidenced; the patch level is not — the banner
+            # carries no revision. Say which release the version names.
+            return PatchAssessment(
+                PATCH_LEVEL_UNKNOWN, REASON_STOCK_VERSION_BARE_BANNER, distro,
+                [f"{distro}:{hint.get('distro_release')}"])
         # Distro-tagged but no revision, e.g. "Apache/2.4.57 (Debian)".
         return PatchAssessment(
             PATCH_LEVEL_UNKNOWN, REASON_DISTRO_TAG_NO_REVISION, distro, [])

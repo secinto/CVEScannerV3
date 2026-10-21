@@ -24,7 +24,34 @@ import sys
 import xml.etree.ElementTree as ET
 
 
-def _host_label(host):
+def _synthesized_banner(service):
+    """Rebuild a one-line banner from nmap's product/version/extrainfo.
+
+    Mirrors what nmap itself would print. cvescan's distro detection
+    (detect_distro_from_banner) reads this shape: "OpenSSH_9.6p1 Ubuntu
+    3ubuntu13.16" carries the distro tag, "OpenSSH_9.2p1" and "BIND
+    9.11.36" resolve a frozen-version fingerprint, "Apache/2.4.37 (Red Hat
+    Enterprise Linux)" carries the el Server tag.
+    """
+    product = service.get("product") or ""
+    version = service.get("version") or ""
+    extrainfo = service.get("extrainfo") or ""
+    name = service.get("name") or ""
+    if name == "ssh" and version:
+        # nmap splits OpenSSH banners into product/version/extrainfo; the
+        # version attribute already holds the upstream version and distro
+        # revision ("9.6p1 Ubuntu 3ubuntu13.16").
+        banner = f"OpenSSH_{version}"
+    elif name in ("http", "https") and product and version:
+        banner = f"{product}/{version}"
+    elif product and version:
+        banner = f"{product} {version}"
+    else:
+        banner = ""
+    if not banner:
+        return ""
+    tail = " ".join(extrainfo.split())
+    return f"{banner} {tail}".strip()
     """Best human-readable identifier for a host element (hostname or IP)."""
     hostname = host.find("./hostnames/hostname")
     if hostname is not None and hostname.get("name"):
@@ -86,6 +113,10 @@ def _service_to_entry(port, host_name):
     else:
         # No CPE and no product name — nothing to match on.
         return None
+
+    banner = _synthesized_banner(service)
+    if banner:
+        entry["banner"] = banner
 
     return entry
 
