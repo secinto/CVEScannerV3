@@ -424,7 +424,7 @@ python extra/cvescan.py scan -p openssh -v 4.7 --maxcve 5
   as no version, unless NVD numbers a release of the product by date
   (bozohttpd). `match_info.version_ignored` records it.
 
-`extra/testdata/nvd-corpus` holds the NVD records and 604 expected outcomes
+`extra/testdata/nvd-corpus` holds the NVD records and 607 expected outcomes
 from production scans. `TestNvdCorpus` builds a database from them and checks
 every case; add a case there when a scan shows a wrong match.
 

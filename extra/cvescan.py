@@ -983,6 +983,32 @@ def annotate_confidence(cve_list, distro, distro_release, backport_results,
 # High-level scan orchestration
 # ---------------------------------------------------------------------------
 
+def _banner_refines_cpe_version(cpe_version_info, banner_version):
+    """True when the banner version is the CPE's version plus more detail.
+
+    nmap reads the CPE and the banner version from different parts of the
+    fingerprint. For 'OpenSSH 9.6p1 Ubuntu 3ubuntu13.4' the banner version
+    carries the distro patch suffix the CPE drops, so it should win. For
+    'Werkzeug httpd 3.1.7' nmap instead emits cpe:/a:python:python:3.12.3
+    from the extrainfo: there the banner version belongs to Werkzeug, not to
+    Python, and overriding the CPE version would score Python 3.12.3 against
+    Python 3.1's CVE history (cvescannerv3-z8q). Override is therefore
+    allowed only when the banner version starts with the CPE's version at a
+    component boundary; otherwise the CPE version stands.
+
+    A CPE without a version (or with a range bound, which nmap never emits)
+    keeps the banner version: it carries nothing to contradict, and nmap
+    omits the CPE version when it knows the product only.
+    """
+    if cpe_version_info["empty"] or cpe_version_info["range_"]:
+        return True
+    cpe_ver = cpe_version_info["ver"]
+    if not banner_version.startswith(cpe_ver):
+        return False
+    rest = banner_version[len(cpe_ver):]
+    return not rest or not rest[0].isdigit()
+
+
 def scan_service(cur, service, aliases, maxcve, cache=None,
                  cpe_to_pkg=None, online=False, foreign_vendors=None):
     """Scan a single service entry and return a result dict.
@@ -1007,8 +1033,10 @@ def scan_service(cur, service, aliases, maxcve, cache=None,
         # CPE is the canonical NVD identifier; do NOT override with banner labels
         # (NVD products are lowercase; banner-derived labels are often capitalised
         # and would cause case-sensitive SQL lookups to miss every row).
-        if service.get("version") is not None:
-            version_info = parse_version(service["version"])
+        banner_version = service.get("version")
+        if banner_version is not None and _banner_refines_cpe_version(
+                version_info, banner_version):
+            version_info = parse_version(banner_version)
     elif service.get("product"):
         product = service["product"].lower()
         version_info = parse_version(service.get("version"))

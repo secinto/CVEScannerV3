@@ -475,6 +475,48 @@ class TestParseCpe(unittest.TestCase):
         self.assertIsNone(info)
 
 
+class TestBannerRefinesCpeVersion(unittest.TestCase):
+    """Which banner versions may override the CPE's (cvescannerv3-z8q)."""
+
+    def setUp(self):
+        from cvescan import _banner_refines_cpe_version
+        self.refine = _banner_refines_cpe_version
+
+    def refine_for_cpe(self, cpe):
+        return lambda banner: self.refine(parse_cpe(cpe)[1], banner)
+
+    def test_banner_suffix_kept(self):
+        # nmap CPE 9.6p1, banner carries the distro patch suffix: keep banner.
+        refine = self.refine_for_cpe("cpe:/a:openbsd:openssh:9.6p1")
+        self.assertTrue(refine("9.6p1 Ubuntu 3ubuntu13.4"))
+
+    def test_banner_packaging_suffix_kept(self):
+        refine = self.refine_for_cpe("cpe:/a:python:python:3.1.5")
+        self.assertTrue(refine("3.1.5-1ubuntu0.1"))
+
+    def test_banner_minor_bump_kept(self):
+        refine = self.refine_for_cpe("cpe:/a:python:python:3.1")
+        self.assertTrue(refine("3.1.7"))
+
+    def test_banner_from_other_product_rejected(self):
+        # 'Werkzeug httpd 3.1.7' beside cpe:/a:python:python:3.12.3.
+        refine = self.refine_for_cpe("cpe:/a:python:python:3.12.3")
+        self.assertFalse(refine("3.1.7"))
+
+    def test_banner_component_prefix_mismatch_rejected(self):
+        # '3.14' is not '3.1.x'; a string-only prefix would accept it.
+        refine = self.refine_for_cpe("cpe:/a:python:python:3.1")
+        self.assertFalse(refine("3.14"))
+
+    def test_banner_greater_version_rejected(self):
+        refine = self.refine_for_cpe("cpe:/a:python:python:3.12.3")
+        self.assertFalse(refine("3.13.5"))
+
+    def test_cpe_without_version_keeps_banner(self):
+        refine = self.refine_for_cpe("cpe:/a:python:python")
+        self.assertTrue(refine("3.12.3"))
+
+
 # ---------------------------------------------------------------------------
 # Tests: Version matching
 # ---------------------------------------------------------------------------

@@ -73,7 +73,10 @@ def _service_to_entry(port, host_name):
     if app_cpe:
         entry["cpe"] = app_cpe
         # Carry the banner version too: cvescan re-parses it over the CPE
-        # version, which keeps update/patch suffixes nmap split off.
+        # version when it extends the CPE's at a component boundary, which
+        # keeps update/patch suffixes nmap split off. A banner version from a
+        # different product (Werkzeug 3.1.7 beside cpe:/a:python:python:3.12.3)
+        # is ignored there; see _banner_refines_cpe_version in cvescan.py.
         if version:
             entry["version"] = version
     elif product:
