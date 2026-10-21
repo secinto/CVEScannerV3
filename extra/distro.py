@@ -61,15 +61,23 @@ DEBIAN_OPENSSH_RELEASES = {
 # RHEL family freezes exactly one OpenSSH version per major release and never
 # bumps the version string — fixes are backported as RPM release bumps
 # (openssh-8.0p1-19.el8 → -29.el8_10). So the bare upstream version in the SSH
-# banner deterministically identifies the el major. Banner has no portable
-# "pN" suffix and no Debian-/Ubuntu- tag, e.g. "SSH-2.0-OpenSSH_8.0".
-#   el7 → 7.4,  el8 → 8.0,  el9 → 8.7,  el10 → 9.9
+# banner deterministically identifies the el major — EXCEPT 9.9: el10 shipped
+# it as the base version, but AlmaLinux 9.8 rebased to 9.9p1 too (backports
+# rows 9.9p1-7.el9_8.alma.1), so a banner "OpenSSH_9.9" can be either. Like
+# the rebased httpd versions, an ambiguous version pins no release; el10/el9
+# hosts on 9.9 resolve to distro=rhel with release=None (no false
+# suppression) and the release is meant to be pinned later via cross-service
+# host-level OS propagation (cvescannerv3-5qb). Banner has no portable "pN"
+# suffix and no Debian-/Ubuntu- tag, e.g. "SSH-2.0-OpenSSH_8.0".
+#   el7 → 7.4,  el8 → 8.0,  el9 → 8.7,  el10 → 9.9 (ambiguous with el9.8)
 RHEL_OPENSSH_RELEASES = {
     "7.4": "7",
     "8.0": "8",
     "8.7": "9",
-    "9.9": "10",
 }
+
+# el OpenSSH versions the frozen-version argument cannot pin to one major.
+RHEL_OPENSSH_AMBIGUOUS = {"9.9"}
 
 # RHEL family also freezes the Apache httpd version per major and backports
 # fixes as RPM release bumps. BUT, unlike OpenSSH, httpd is periodically
@@ -297,6 +305,17 @@ def detect_distro_from_banner(banner):
                 return {
                     "distro": "rhel",
                     "distro_release": el_major,
+                    "package_revision": None,
+                }
+            if m.group(1) in RHEL_OPENSSH_AMBIGUOUS:
+                # An el version more than one major carries (9.9: el10 base,
+                # but AlmaLinux 9.8 rebased to 9.9p1 too). The family is still
+                # solid — no Debian/Ubuntu release ships it — but the version
+                # pins no major, so the release stays for corroboration to
+                # resolve (cvescannerv3-5qb).
+                return {
+                    "distro": "rhel",
+                    "distro_release": None,
                     "package_revision": None,
                 }
 

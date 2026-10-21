@@ -1469,6 +1469,17 @@ class TestExplainPatchConfidence(unittest.TestCase):
             explain_patch_confidence(hint, "2.4.62"),
             PATCH_LEVEL_UNKNOWN, REASON_EL_RELEASE_UNRESOLVED, "rhel", [])
 
+    def test_ambiguous_openssh_9_9_pins_no_release(self):
+        # el10 shipped 9.9 as its base, but AlmaLinux 9.8 rebased to 9.9p1 —
+        # the banner version is not a collision-free el discriminator there
+        # (cvescannerv3-5qb). Distro resolves, release does not.
+        hint = detect_distro_from_banner("OpenSSH_9.9")
+        self.assertEqual(hint["distro"], "rhel")
+        self.assertIsNone(hint["distro_release"])
+        self.assertAssessment(
+            explain_patch_confidence(hint, "9.9"),
+            PATCH_LEVEL_UNKNOWN, REASON_EL_RELEASE_UNRESOLVED, "rhel", [])
+
     def test_rhel_revision_wins_over_a_missing_release(self):
         # detect_distro_from_banner never gives a rhel hint a revision, so build
         # one. The revision is the direct evidence and is checked first: with
