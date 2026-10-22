@@ -120,6 +120,42 @@
       "citation": "https://launchpad.net/ubuntu/+source/libpam-opie",
       "added_by": "analyst",
       "date": "2026-10-22"
+    },
+    {
+      "cve": "CVE-2007-2768",
+      "distro": "Debian",
+      "release": "11",
+      "package": "openssh",
+      "disposition": "not_affected",
+      "fixed_version": null,
+      "reason": "OPIE for PAM is not part of the Debian archive, so the precondition of this CVE cannot be met: the libpam-opie and opie source packages were last shipped in squeeze (Debian 6) and exist in no later suite (sources.debian.org). Debian's tracker still lists openssh as unfixed with urgency \"unimportant\" (bug 436571), which the OSV feed turns into \"affected\"; that row records a decision not to patch, not a reachable flaw. NVD lists the record with no version bounds, so it matches every OpenSSH release. Verified 2026-10-22.",
+      "citation": "https://security-tracker.debian.org/tracker/CVE-2007-2768",
+      "added_by": "analyst",
+      "date": "2026-10-22"
+    },
+    {
+      "cve": "CVE-2007-2768",
+      "distro": "Debian",
+      "release": "12",
+      "package": "openssh",
+      "disposition": "not_affected",
+      "fixed_version": null,
+      "reason": "OPIE for PAM is not part of the Debian archive, so the precondition of this CVE cannot be met: the libpam-opie and opie source packages were last shipped in squeeze (Debian 6) and exist in no later suite (sources.debian.org). Debian's tracker still lists openssh as unfixed with urgency \"unimportant\" (bug 436571), which the OSV feed turns into \"affected\"; that row records a decision not to patch, not a reachable flaw. NVD lists the record with no version bounds, so it matches every OpenSSH release. Verified 2026-10-22.",
+      "citation": "https://security-tracker.debian.org/tracker/CVE-2007-2768",
+      "added_by": "analyst",
+      "date": "2026-10-22"
+    },
+    {
+      "cve": "CVE-2007-2768",
+      "distro": "Debian",
+      "release": "13",
+      "package": "openssh",
+      "disposition": "not_affected",
+      "fixed_version": null,
+      "reason": "OPIE for PAM is not part of the Debian archive, so the precondition of this CVE cannot be met: the libpam-opie and opie source packages were last shipped in squeeze (Debian 6) and exist in no later suite (sources.debian.org). Debian's tracker still lists openssh as unfixed with urgency \"unimportant\" (bug 436571), which the OSV feed turns into \"affected\"; that row records a decision not to patch, not a reachable flaw. NVD lists the record with no version bounds, so it matches every OpenSSH release. Verified 2026-10-22.",
+      "citation": "https://security-tracker.debian.org/tracker/CVE-2007-2768",
+      "added_by": "analyst",
+      "date": "2026-10-22"
     }
   ]
 }
