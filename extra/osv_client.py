@@ -4,9 +4,12 @@
 
 """OSV.dev REST API client for online CVE enrichment."""
 
+import re
+
 import httpx
 
 OSV_QUERYBATCH_URL = "https://api.osv.dev/v1/querybatch"
+OSV_VULN_URL = "https://osv.dev/vulnerability/{}"
 
 
 def build_osv_ecosystem(distro, release):
@@ -31,8 +34,11 @@ def query_osv_batch(queries, timeout=30):
         timeout: request timeout in seconds
 
     Returns:
-        list of result dicts (one per query), or empty list on error.
-        Each result has a "vulns" key with list of matching vulnerabilities.
+        list of result dicts (one per query), or None when any request failed.
+        Each result has a "vulns" key with the matching vulnerabilities (id and
+        modified only) and, when OSV paged the answer, a "next_page_token".
+        A failed request is not an empty answer: the caller must not read
+        "no vulnerability listed" into it.
     """
     if not queries:
         return []
@@ -48,18 +54,45 @@ def query_osv_batch(queries, timeout=30):
                 timeout=timeout,
             )
             resp.raise_for_status()
-            data = resp.json()
-            all_results.extend(data.get("results", []))
+            results = resp.json().get("results", [])
         except (httpx.HTTPError, httpx.TimeoutException, ValueError):
-            # Graceful degradation: return empty results for this batch
-            all_results.extend([{"vulns": []} for _ in batch])
+            return None
+        if len(results) != len(batch):
+            return None
+        all_results.extend(results)
 
     return all_results
 
 
+# OSV names a distro record after the CVE it tracks: "UBUNTU-CVE-2023-51767",
+# "DEBIAN-CVE-2024-6387". querybatch returns no aliases, so the CVE id is read
+# from the record id itself.
+_CVE_IN_OSV_ID = re.compile(r"(?:^|-)(CVE-\d{4}-\d+)$")
+
+
+def _cve_ids_by_osv_id(result):
+    """Map CVE id → OSV record id for one querybatch result, or None when
+    OSV paged the answer (the list is then incomplete)."""
+    if result.get("next_page_token"):
+        return None
+    out = {}
+    for vuln in result.get("vulns") or []:
+        m = _CVE_IN_OSV_ID.search(vuln.get("id", ""))
+        if m:
+            out.setdefault(m.group(1), vuln["id"])
+    return out
+
+
 def enrich_from_osv(uncertain_cves, distro, distro_release, pkg_name,
                     installed_version):
-    """Query OSV for uncertain CVEs and determine if they affect the installed version.
+    """Ask OSV whether uncertain CVEs affect the installed package version.
+
+    Two queries for the package in the release's ecosystem: one with the
+    installed version (the records that affect it) and one without (every
+    record OSV has for the package). A CVE is "not_affected" only when OSV has
+    a record for it here and that record does not list the installed version.
+    A CVE OSV has no record for stays "unknown": the absence of a record is
+    not a verdict. So is every CVE when a request fails or OSV pages the answer.
 
     Args:
         uncertain_cves: list of CVE ID strings to check
@@ -69,42 +102,39 @@ def enrich_from_osv(uncertain_cves, distro, distro_release, pkg_name,
         installed_version: distro-native version string
 
     Returns:
-        dict mapping cve_id → "affected" | "not_affected" | "unknown"
+        dict mapping cve_id → {"status": "affected" | "not_affected" |
+        "unknown", "ecosystem": str, "osv_id": str or None}
     """
     ecosystem = build_osv_ecosystem(distro, distro_release)
-    if not ecosystem or not pkg_name:
-        return {cve_id: "unknown" for cve_id in uncertain_cves}
 
-    # Build a single query: package + version → get all vulns affecting it
-    queries = [
-        {
-            "package": {"name": pkg_name, "ecosystem": ecosystem},
-            "version": installed_version,
-        }
-    ]
+    def unknown():
+        return {cve_id: {"status": "unknown", "ecosystem": ecosystem,
+                         "osv_id": None}
+                for cve_id in uncertain_cves}
 
-    results = query_osv_batch(queries)
+    if not ecosystem or not pkg_name or not installed_version:
+        return unknown()
+
+    package = {"name": pkg_name, "ecosystem": ecosystem}
+    results = query_osv_batch([
+        {"package": package, "version": installed_version},
+        {"package": package},
+    ])
     if not results:
-        return {cve_id: "unknown" for cve_id in uncertain_cves}
-
-    # Collect all CVE aliases from the OSV response
-    affected_cves = set()
-    vulns = results[0].get("vulns", [])
-    for vuln in vulns:
-        # The vuln ID itself might be a CVE
-        vid = vuln.get("id", "")
-        if vid.startswith("CVE-"):
-            affected_cves.add(vid)
-        # Check aliases
-        for alias in vuln.get("aliases", []):
-            if alias.startswith("CVE-"):
-                affected_cves.add(alias)
+        return unknown()
+    affecting = _cve_ids_by_osv_id(results[0])
+    known = _cve_ids_by_osv_id(results[1])
+    if affecting is None or known is None:
+        return unknown()
 
     result = {}
     for cve_id in uncertain_cves:
-        if cve_id in affected_cves:
-            result[cve_id] = "affected"
+        if cve_id in affecting:
+            status, osv_id = "affected", affecting[cve_id]
+        elif cve_id in known:
+            status, osv_id = "not_affected", known[cve_id]
         else:
-            result[cve_id] = "not_affected"
-
+            status, osv_id = "unknown", None
+        result[cve_id] = {"status": status, "ecosystem": ecosystem,
+                          "osv_id": osv_id}
     return result

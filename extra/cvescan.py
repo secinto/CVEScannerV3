@@ -1172,34 +1172,58 @@ def scan_service(cur, service, aliases, maxcve, cache=None,
             ]
             if uncertain_ids:
                 try:
-                    from osv_client import enrich_from_osv
+                    from osv_client import OSV_VULN_URL, enrich_from_osv
                     from distro import get_osv_ecosystem_parts
 
                     osv_prefix, osv_release = get_osv_ecosystem_parts(
                         distro, distro_release
                     )
-                    # Resolve package name for OSV
+                    # Resolve package name for OSV, per release as
+                    # check_backports does
                     pkg_name = None
                     if cpe_vendor and cpe_product:
                         key = f"{cpe_vendor}:{cpe_product}"
                         mapping = cpe_to_pkg.get(key, {})
-                        pkg_name = mapping.get(distro)
+                        pkg_name = _resolve_pkg_name(mapping.get(distro),
+                                                     osv_release)
 
-                    if pkg_name and installed_version:
+                    if pkg_name and installed_version and osv_prefix:
                         osv_results = enrich_from_osv(
                             uncertain_ids, distro, distro_release,
                             pkg_name, installed_version,
                         )
-                        for cve_id, osv_status in osv_results.items():
-                            if osv_status == "not_affected":
+                        source = f"osv-{osv_prefix.lower()}"
+                        for cve_id, osv in osv_results.items():
+                            # "unknown" (no OSV record here, or OSV not
+                            # reachable) leaves the CVE unknown: absence is
+                            # not a verdict.
+                            if osv["status"] == "unknown":
+                                continue
+                            meta = {
+                                "source": source,
+                                "citation": OSV_VULN_URL.format(osv["osv_id"]),
+                            }
+                            if osv["status"] == "not_affected":
                                 backport_results[cve_id] = {
                                     "status": "patched",
+                                    "disposition": "fixed",
                                     "fixed_version": None,
+                                    "reason": (
+                                        f"OSV {osv['ecosystem']}: "
+                                        f"{osv['osv_id']} does not list "
+                                        f"{installed_version} as affected"),
+                                    **meta,
                                 }
-                            elif osv_status == "affected":
+                            elif osv["status"] == "affected":
                                 backport_results[cve_id] = {
                                     "status": "affected",
+                                    "disposition": "affected",
                                     "fixed_version": None,
+                                    "reason": (
+                                        f"OSV {osv['ecosystem']}: "
+                                        f"{osv['osv_id']} lists "
+                                        f"{installed_version} as affected"),
+                                    **meta,
                                 }
                 except ImportError:
                     pass  # osv_client not available

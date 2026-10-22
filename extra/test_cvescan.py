@@ -944,6 +944,62 @@ class TestScanService(unittest.TestCase):
         self.assertGreater(result["total_cves"], 0)
 
 
+_OSV_SERVICE = {"cpe": "cpe:/a:openbsd:openssh:4.7p1", "distro": "ubuntu",
+                "distro_release": "noble",
+                "installed_version": "1:4.7p1-1ubuntu1"}
+_OSV_CPE_TO_PKG = {"openbsd:openssh": {"ubuntu": "openssh"}}
+
+
+class TestScanServiceOnlineOsv(unittest.TestCase):
+    """The online OSV fallback: a suppression needs an OSV record that leaves
+    out the installed version, and carries its reason, source and citation.
+    No record, or no answer, keeps the CVE where it was."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.conn = create_test_db()
+        cls.cur = cls.conn.cursor()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.cur.close()
+        cls.conn.close()
+
+    def _scan(self, osv_answer):
+        import osv_client
+        with mock.patch.object(osv_client, "query_osv_batch",
+                               return_value=osv_answer):
+            return scan_service(self.cur, dict(_OSV_SERVICE), aliases=None,
+                                maxcve=0, cpe_to_pkg=_OSV_CPE_TO_PKG,
+                                online=True)
+
+    def test_record_without_the_version_suppresses_with_evidence(self):
+        vulns = lambda *ids: {"vulns": [{"id": i} for i in ids]}
+        result = self._scan([vulns("UBUNTU-CVE-2018-15473"),
+                             vulns("UBUNTU-CVE-2018-15473", "UBUNTU-CVE-2016-1908")])
+        patched = {c["cve_id"]: c for c in result.get("likely_patched", [])}
+        self.assertEqual(list(patched), ["CVE-2016-1908"])
+        cve = patched["CVE-2016-1908"]
+        self.assertEqual(cve["disposition"], "fixed")
+        self.assertEqual(cve["source"], "osv-ubuntu")
+        self.assertEqual(cve["citation"],
+                         "https://osv.dev/vulnerability/UBUNTU-CVE-2016-1908")
+        self.assertEqual(cve["reason"], "OSV Ubuntu:24.04: UBUNTU-CVE-2016-1908 "
+                                        "does not list 1:4.7p1-1ubuntu1 as affected")
+        active = {c["cve_id"]: c for c in result["cves"]}
+        self.assertEqual(active["CVE-2018-15473"]["disposition"], "affected")
+        self.assertEqual(active["CVE-2018-15473"]["source"], "osv-ubuntu")
+        # No OSV record: stays active, with no invented verdict.
+        self.assertEqual(active["CVE-2020-1234"]["disposition"], "unknown")
+        self.assertEqual(active["CVE-2020-1234"]["confidence"], "UNCERTAIN")
+        self.assertNotIn("source", active["CVE-2020-1234"])
+
+    def test_osv_unreachable_suppresses_nothing(self):
+        result = self._scan(None)
+        self.assertNotIn("likely_patched", result)
+        self.assertEqual(len(result["cves"]), result["total_cves"])
+
+
 class TestRunScan(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
