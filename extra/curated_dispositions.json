@@ -72,6 +72,54 @@
       "citation": "https://access.redhat.com/security/cve/CVE-2007-2768",
       "added_by": "analyst",
       "date": "2026-09-09"
+    },
+    {
+      "cve": "CVE-2023-51767",
+      "distro": "Ubuntu",
+      "release": "24.04",
+      "package": "openssh",
+      "disposition": "not_affected",
+      "fixed_version": null,
+      "reason": "Ubuntu marks every release it triaged not-affected (trusty to mantic, \"see notes\"): the researchers used a modified sshd, there is no indication the Ubuntu openssh package can be exploited the same way, and upstream declined the issue as not exploitable in practice. 24.04 was never triaged, so the tracker carries no row for it; 24.04 ships the same openssh code base (9.6p1) and the same reasoning holds. The attack needs a local Rowhammer/DRAM bit-flip primitive (CVSS AV:L/AC:H/PR:L) and cannot be reached by an external scan. Verified 2026-10-22.",
+      "citation": "https://ubuntu.com/security/CVE-2023-51767",
+      "added_by": "analyst",
+      "date": "2026-10-22"
+    },
+    {
+      "cve": "CVE-2007-2768",
+      "distro": "Ubuntu",
+      "release": "20.04",
+      "package": "openssh",
+      "disposition": "not_affected",
+      "fixed_version": null,
+      "reason": "OPIE for PAM is not part of the Ubuntu archive, so the precondition of this CVE cannot be met: the libpam-opie and opie source packages were deleted in oneiric (11.10) and exist in no later Ubuntu release (Launchpad publishing history), and Debian, which Ubuntu's openssh is built from, ships no libpam-opie in any suite either. Ubuntu's tracker last triaged this CVE for gutsy (7.10, priority negligible), so it carries no row for a supported release. NVD lists the record with no version bounds, so it matches every OpenSSH release. Verified 2026-10-22.",
+      "citation": "https://launchpad.net/ubuntu/+source/libpam-opie",
+      "added_by": "analyst",
+      "date": "2026-10-22"
+    },
+    {
+      "cve": "CVE-2007-2768",
+      "distro": "Ubuntu",
+      "release": "22.04",
+      "package": "openssh",
+      "disposition": "not_affected",
+      "fixed_version": null,
+      "reason": "OPIE for PAM is not part of the Ubuntu archive, so the precondition of this CVE cannot be met: the libpam-opie and opie source packages were deleted in oneiric (11.10) and exist in no later Ubuntu release (Launchpad publishing history), and Debian, which Ubuntu's openssh is built from, ships no libpam-opie in any suite either. Ubuntu's tracker last triaged this CVE for gutsy (7.10, priority negligible), so it carries no row for a supported release. NVD lists the record with no version bounds, so it matches every OpenSSH release. Verified 2026-10-22.",
+      "citation": "https://launchpad.net/ubuntu/+source/libpam-opie",
+      "added_by": "analyst",
+      "date": "2026-10-22"
+    },
+    {
+      "cve": "CVE-2007-2768",
+      "distro": "Ubuntu",
+      "release": "24.04",
+      "package": "openssh",
+      "disposition": "not_affected",
+      "fixed_version": null,
+      "reason": "OPIE for PAM is not part of the Ubuntu archive, so the precondition of this CVE cannot be met: the libpam-opie and opie source packages were deleted in oneiric (11.10) and exist in no later Ubuntu release (Launchpad publishing history), and Debian, which Ubuntu's openssh is built from, ships no libpam-opie in any suite either. Ubuntu's tracker last triaged this CVE for gutsy (7.10, priority negligible), so it carries no row for a supported release. NVD lists the record with no version bounds, so it matches every OpenSSH release. Verified 2026-10-22.",
+      "citation": "https://launchpad.net/ubuntu/+source/libpam-opie",
+      "added_by": "analyst",
+      "date": "2026-10-22"
     }
   ]
 }
