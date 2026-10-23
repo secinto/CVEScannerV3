@@ -702,6 +702,10 @@ UBUNTU_PAGE_SIZE = 20
 UBUNTU_MAX_RETRIES = 5
 UBUNTU_BACKOFF_BASE = 3.0
 UBUNTU_PAGE_PAUSE = 0.5
+# Its 503/504 spells outlast those retries (~45 s). A page that still fails is
+# tried again after RESUME_PAUSE, 2x and 3x that, before the update fails.
+UBUNTU_RESUME_ROUNDS = 3
+UBUNTU_RESUME_PAUSE = 60.0
 
 
 def summarize_ubuntu_rows(package, releases, definitive, soft, cves_seen):
@@ -762,6 +766,9 @@ def update_backports_ubuntu(db_path, releases=("24.04", "22.04", "20.04"),
     replace an existing row, while softer ones (affected / wont_fix /
     fix_deferred) insert-or-ignore — a row already known to be fixed must never
     be downgraded to affected.
+
+    Raises DatabaseUpdateError when a page keeps failing: a package is either
+    complete or the update fails, never silently missing.
     """
     page_size = min(page_size, UBUNTU_PAGE_SIZE)
 
@@ -789,20 +796,29 @@ def update_backports_ubuntu(db_path, releases=("24.04", "22.04", "20.04"),
         db.setup()
         total = 0
         for package in packages:
-            entries, offset = [], 0
+            entries, offset, failures = [], 0, 0
             while True:
                 url = (f"{UBUNTU_SECURITY_API}/cves.json?package={package}"
                        f"&limit={page_size}&offset={offset}")
                 try:
                     page = _get(url)
                 except (httpx.HTTPError, httpx.TimeoutException, ValueError) as e:
-                    # Partial data is worse than none here: a missing page
-                    # would look like "Canonical has no verdict", which reads
-                    # as unfixed. Drop the package rather than half-record it.
+                    # A missing page would read as "Canonical has no verdict",
+                    # i.e. unfixed, and a dropped package ships a database
+                    # without its verdicts. So wait the outage out and resume
+                    # at this page; if it lasts, fail the update so the caller
+                    # retries it whole.
+                    failures += 1
+                    if failures > UBUNTU_RESUME_ROUNDS:
+                        raise DatabaseUpdateError(
+                            f"Ubuntu fetch for {package} failed at offset "
+                            f"{offset} after {UBUNTU_RESUME_ROUNDS} resumes: {e}"
+                        ) from e
+                    pause = UBUNTU_RESUME_PAUSE * failures
                     print(f"[!] Ubuntu fetch failed for {package} "
-                          f"(offset {offset}): {e} — skipping package")
-                    entries = []
-                    break
+                          f"(offset {offset}): {e} — resuming in {pause:.0f}s")
+                    time.sleep(pause)
+                    continue
                 if page is None:
                     entries = []
                     break
