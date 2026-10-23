@@ -202,6 +202,8 @@ from datetime import datetime, timedelta, timezone  # noqa: E402
 from unittest import mock  # noqa: E402
 from urllib.parse import parse_qs, urlparse  # noqa: E402
 
+import httpx  # noqa: E402
+
 import database  # noqa: E402
 
 
@@ -437,6 +439,57 @@ class TestRefreshRaw(unittest.TestCase):
         # fetches them. Every record still in the window is here.
         self.assertEqual(self._cached_ids(),
                          {f"CVE-2026-{i:04d}" for i in range(3, 12)})
+
+
+class _FakeUbuntu:
+    """Canonical's cves.json over `count` openssh CVEs; `down` maps an offset
+    to how many requests for it answer 504 before it recovers."""
+
+    def __init__(self, count, down=None):
+        self.cves = [{"id": f"CVE-2026-{i:04d}", "packages": [{"name": "openssh", "statuses": [
+            {"release_codename": "noble", "status": "not-affected"}]}]} for i in range(count)]
+        self.down = dict(down or {})
+
+    def __call__(self, url, **_):
+        query = parse_qs(urlparse(url).query)
+        offset, limit = int(query["offset"][0]), int(query["limit"][0])
+        request = httpx.Request("GET", url)
+        if self.down.get(offset, 0) > 0:
+            self.down[offset] -= 1
+            return httpx.Response(504, request=request)
+        return httpx.Response(200, request=request, json={
+            "cves": self.cves[offset:offset + limit], "total_results": len(self.cves)})
+
+
+class TestUpdateBackportsUbuntu(unittest.TestCase):
+    """Two pages of 20; a request fails UBUNTU_MAX_RETRIES times per round."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = str(Path(self.tmp.name) / "cve.db")
+        self.sleep = mock.patch.object(database.time, "sleep").start()
+        self.addCleanup(mock.patch.stopall)
+
+    def _run(self, api):
+        with mock.patch.object(database.httpx, "get", api):
+            database.update_backports_ubuntu(self.db, releases=("24.04",))
+
+    def _rows(self):
+        with sqlite3.connect(self.db) as conn:
+            return conn.execute("SELECT COUNT(*) FROM backports WHERE source = 'ubuntu-security'").fetchone()[0]
+
+    def test_a_page_that_stays_down_past_the_retries_is_resumed(self):
+        self._run(_FakeUbuntu(30, down={20: database.UBUNTU_MAX_RETRIES * 2}))
+        self.assertEqual(self._rows(), 30)
+        resumes = [c.args[0] for c in self.sleep.call_args_list
+                   if c.args[0] >= database.UBUNTU_RESUME_PAUSE]
+        self.assertEqual(resumes, [database.UBUNTU_RESUME_PAUSE, 2 * database.UBUNTU_RESUME_PAUSE])
+
+    def test_an_outage_that_lasts_fails_the_update(self):
+        down = database.UBUNTU_MAX_RETRIES * (database.UBUNTU_RESUME_ROUNDS + 1)
+        with self.assertRaisesRegex(database.DatabaseUpdateError, "openssh failed at offset 20"):
+            self._run(_FakeUbuntu(30, down={20: down}))
 
 
 class TestPopulateFromRaw(unittest.TestCase):
