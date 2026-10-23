@@ -2,11 +2,15 @@
 
 """Tests for database.py — CVE database build tooling."""
 
+import os
 import sys
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+# The NVD rate limiter is built at import; the raw-cache tests fake NVD, so
+# let their page fetches through without waiting.
+os.environ.setdefault("NVD_RATE_PER_30S", "100000")
 
 from database import applicable_cpes, classify_cpes, summarize_ubuntu_rows  # noqa: E402
 
@@ -193,7 +197,10 @@ if __name__ == "__main__":
 import json  # noqa: E402
 import sqlite3  # noqa: E402
 import tempfile  # noqa: E402
+from concurrent.futures import ThreadPoolExecutor  # noqa: E402
 from datetime import datetime, timedelta, timezone  # noqa: E402
+from unittest import mock  # noqa: E402
+from urllib.parse import parse_qs, urlparse  # noqa: E402
 
 import database  # noqa: E402
 
@@ -292,6 +299,144 @@ class TestMergeRaw(unittest.TestCase):
         database.merge_raw(self.raw, self.delta)
         self.assertEqual((self.raw / "cpes.txt").read_text().split(),
                          ["cpe:2.3:a:a:a:1:*:*:*:*:*:*:*", "cpe:2.3:a:b:b:1:*:*:*:*:*:*:*"])
+
+
+class _FakeNvd:
+    """Serves NVD pages by offset from lists a test may change mid-fetch."""
+
+    def __init__(self, cves):
+        self.data = {"cves": list(cves), "cpes": []}
+        self.fail = set()  # (kind, startIndex) pages that always fail
+        self.after_page = None  # called with (kind, start) after a page is served
+
+    def __call__(self, url, headers=None, **_):
+        kind = "cves" if "/cves/" in url else "cpes"
+        query = parse_qs(urlparse(url).query)
+        start = int(query["startIndex"][0])
+        size = int(query.get("resultsPerPage", [database.CONST[kind[:-1]]])[0])
+        if (kind, start) in self.fail:
+            raise database.DatabaseUpdateError(f"NVD down for {kind} {start}")
+        items = self.data[kind][start:start + size]
+        page = {"totalResults": len(self.data[kind]),
+                "vulnerabilities": [{"cve": cve} for cve in items],
+                "products": [{"cpe": {"cpeName": cpe}} for cpe in items]}
+        if size > 1 and self.after_page:
+            self.after_page(kind, start)
+        return page
+
+
+class TestRefreshRaw(unittest.TestCase):
+    """refresh_raw over a fake NVD with 4 CVEs per page."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.raw = Path(self.tmp.name)
+        self.nvd = _FakeNvd(_cve(f"CVE-2026-{i:04d}", "cpe:2.3:a:v:p:1:*:*:*:*:*:*:*")
+                            for i in range(12))
+        for patcher in (
+            mock.patch.object(database, "nvd_get_json", self.nvd),
+            mock.patch.dict(database.CONST, {"cve": 4}),
+            # One page at a time, in order, so a test can change NVD between pages.
+            mock.patch.object(database, "ThreadPoolExecutor",
+                              lambda: ThreadPoolExecutor(max_workers=1)),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _cached_ids(self):
+        with (self.raw / "cves.jsonl").open() as f:
+            return {json.loads(line)["id"] for line in f}
+
+    def _start_from_a_recent_cache(self):
+        _write_lines(self.raw / "cves.jsonl", [])
+        _write_lines(self.raw / "cpes.txt", [])
+        last_mod = datetime.now(timezone.utc) - timedelta(days=1)
+        (self.raw / "meta.json").write_text(json.dumps({"last_mod": last_mod.isoformat()}))
+
+    def test_a_failed_fetch_resumes_with_the_pages_it_has(self):
+        self.nvd.fail.add(("cves", 4))
+        with self.assertRaises(database.DatabaseUpdateError):
+            database.refresh_raw(self.raw)
+        self.nvd.fail.clear()
+        served = []
+        self.nvd.after_page = lambda kind, start: served.append(start)
+        database.refresh_raw(self.raw)
+        self.assertEqual(served, [4])
+        self.assertEqual(len(self._cached_ids()), 12)
+        self.assertFalse((self.raw / "delta").exists())
+
+    def test_the_resumed_fetch_keeps_the_first_attempts_window(self):
+        self.nvd.fail.add(("cves", 8))
+        with self.assertRaises(database.DatabaseUpdateError):
+            database.refresh_raw(self.raw)
+        until = json.loads((self.raw / "delta" / "plan.json").read_text())["until"]
+        self.nvd.fail.clear()
+        meta = database.refresh_raw(self.raw)
+        self.assertEqual(meta["last_mod"], until)
+
+    def test_a_half_written_page_is_dropped_on_resume(self):
+        self.nvd.fail.add(("cves", 4))
+        with self.assertRaises(database.DatabaseUpdateError):
+            database.refresh_raw(self.raw)
+        (self.raw / "delta" / "cves_000000004.tmp").write_text('{"id":"CVE-2026-')
+        self.nvd.fail.clear()
+        database.refresh_raw(self.raw)
+        self.assertEqual(len(self._cached_ids()), 12)
+
+    def test_pages_of_a_fetch_with_another_start_are_discarded(self):
+        delta = self.raw / "delta"
+        delta.mkdir()
+        (delta / "plan.json").write_text(json.dumps(
+            {"since": "2026-01-01T00:00:00+00:00", "until": "2026-01-02T00:00:00+00:00",
+             "totals": {"cpes": 0, "cves": 4}}))
+        _write_lines(delta / "cves_000000000", [_cve("CVE-1999-9999", "cpe:2.3:a:v:p:1:*:*:*:*:*:*:*")])
+        database.refresh_raw(self.raw)
+        self.assertNotIn("CVE-1999-9999", self._cached_ids())
+        self.assertEqual(len(self._cached_ids()), 12)
+
+    def test_a_record_that_moved_onto_a_fetched_page_is_still_fetched(self):
+        """CVE-2026-0001 changes again after page 4 and leaves the window, so
+        CVE-2026-0008 moves onto page 4; page 8 then starts at CVE-2026-0009."""
+        self._start_from_a_recent_cache()
+
+        def leave_the_window(kind, start):
+            if kind == "cves" and start == 4:
+                del self.nvd.data["cves"][1]
+                self.nvd.after_page = None
+        self.nvd.after_page = leave_the_window
+        database.refresh_raw(self.raw)
+        self.assertIn("CVE-2026-0008", self._cached_ids())
+        self.assertEqual(len(self._cached_ids()), 12)
+
+    def test_a_full_fetch_ignores_records_added_at_the_end(self):
+        added = _cve("CVE-2026-0012", "cpe:2.3:a:v:p:1:*:*:*:*:*:*:*")
+
+        def publish(kind, start):
+            if kind == "cves" and start == 4:
+                self.nvd.data["cves"].append(added)
+                self.nvd.after_page = None
+        self.nvd.after_page = publish
+        database.refresh_raw(self.raw)
+        # Page 8 was planned for 12 records, so it holds 4 of the 5; the
+        # new one waits for the next delta, and no page is fetched twice.
+        self.assertEqual(len(self._cached_ids()), 12)
+
+    def test_a_delta_window_that_changed_too_much_is_fetched_again(self):
+        self._start_from_a_recent_cache()
+
+        def leave_the_window(kind, start):
+            if kind == "cves" and start == 0:
+                del self.nvd.data["cves"][0:3]  # 2 * 3 > 4 records per page
+                self.nvd.after_page = None
+        self.nvd.after_page = leave_the_window
+        database.refresh_raw(self.raw)
+        # The three that left changed again after the window; the next delta
+        # fetches them. Every record still in the window is here.
+        self.assertEqual(self._cached_ids(),
+                         {f"CVE-2026-{i:04d}" for i in range(3, 12)})
 
 
 class TestPopulateFromRaw(unittest.TestCase):

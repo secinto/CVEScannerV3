@@ -1377,6 +1377,7 @@ def update_db(args, thread_objs, populate=False):
 #   cpes.txt    one dictionary cpeName per line, sorted
 #   meta.json   last_mod (when the newest fetch started), full_fetch (when the
 #               last full fetch started), cves and cpes (line counts)
+#   delta/      only while a fetch is unfinished: its pages and plan.json
 # NVD accepts lastMod ranges of at most 120 days, so an older cache is
 # refetched in full.
 RAW_MAX_DELTA_DAYS = 110
@@ -1426,16 +1427,28 @@ def _fetch_raw_page(job):
     tmp.replace(out)
 
 
+def _nvd_total(kind, window):
+    """How many `kind` records NVD holds in `window` right now."""
+    return nvd_get_json(
+        f"{URL['nvd'].format(kind, 0)}&resultsPerPage=1{window}"
+    )["totalResults"]
+
+
 def _fetch_raw_pages(jobs, kind):
-    """Fetch every page; retry failed ones once more, then fail the refresh.
+    """Fetch every page not on disk yet; retry failed ones once more, then fail.
 
     Unlike query_api, a page is never dropped: a cache with a hole would
-    silently lose CVEs from every database built from it.
+    silently lose CVEs from every database built from it. A page file exists
+    only once it is complete (_fetch_raw_page renames it into place), so an
+    attempt that resumes a failed one fetches only the missing pages.
     """
+    todo = [job for job in jobs if not job[2].exists()]
+    if len(todo) < len(jobs):
+        print(f"[*] {kind}: {len(jobs) - len(todo)} of {len(jobs)} pages already fetched")
     failed = []
-    with tqdm(total=len(jobs), ascii=" =", desc=f"[+] Fetching {kind} pages") as bar:
+    with tqdm(total=len(todo), ascii=" =", desc=f"[+] Fetching {kind} pages") as bar:
         with ThreadPoolExecutor() as tpe:
-            futures = {tpe.submit(_fetch_raw_page, job): job for job in jobs}
+            futures = {tpe.submit(_fetch_raw_page, job): job for job in todo}
             for future, job in futures.items():
                 try:
                     future.result()
@@ -1450,6 +1463,91 @@ def _fetch_raw_pages(jobs, kind):
             raise DatabaseUpdateError(
                 f"NVD raw fetch incomplete, {kind} page failed twice: {job[0]}"
             ) from exc
+
+
+def _fill_shift_gaps(kind, window, delta, planned):
+    """Fetch the records the page boundaries may have skipped.
+
+    NVD pages by offset over data that changes while we read it. A record
+    changed again during a delta fetch leaves the window, and every later
+    record moves up one place: a page fetched after that starts one record
+    late, and the record that moved onto the page before it, fetched
+    earlier, is missed. With `gone` records gone (planned minus the current
+    count), a missed record sits at most `gone` places before a boundary, so
+    the 2 * gone records around each boundary hold it; merge_raw drops the
+    duplicates. A full fetch only grows at the end (NVD orders by publish
+    date), which shifts nothing, and the next delta fetches those records.
+
+    Returns False when the gaps are too wide for this, or the window grew.
+    """
+    per_page = CONST[kind[:-1]]
+    covered = 0
+    for _ in range(3):
+        gone = planned - _nvd_total(kind, window)
+        if gone < 0 and not window:
+            gone = 0
+        if gone == covered:
+            return True
+        if gone < 0 or 2 * gone > per_page:
+            return False
+        print(f"[*] {kind}: {gone} records left the window during the fetch;"
+              " refetching around the page boundaries")
+        _fetch_raw_pages([
+            (f"{URL['nvd'].format(kind, max(0, edge - gone))}"
+             f"&resultsPerPage={2 * gone}{window}",
+             kind, delta / f"{kind}_gap{gone:05d}_{edge:09d}")
+            for edge in range(per_page, planned, per_page)
+        ], kind)
+        covered = gone
+    return False
+
+
+def _fetch_raw_kind(kind, window, delta, plan):
+    """Fetch every `kind` record of the plan's window into delta."""
+    per_page = CONST[kind[:-1]]
+    for _ in range(3):
+        if kind not in plan["totals"]:
+            plan["totals"][kind] = _nvd_total(kind, window)
+            _write_plan(delta, plan)
+        total = plan["totals"][kind]
+        print(f"[+] Metadata: {total} {kind.upper()}")
+        _fetch_raw_pages([
+            (f"{URL['nvd'].format(kind, idx)}{window}", kind,
+             delta / f"{kind}_{idx:09d}")
+            for idx in range(0, total, per_page)
+        ], kind)
+        if _fill_shift_gaps(kind, window, delta, total):
+            return
+        print(f"[!] {kind}: the window changed too much during the fetch;"
+              " fetching every page again")
+        for path in delta.glob(f"{kind}_*"):
+            path.unlink()
+        del plan["totals"][kind]
+    raise DatabaseUpdateError(
+        f"NVD raw fetch incomplete, {kind} kept changing during the fetch"
+    )
+
+
+def _write_plan(delta, plan):
+    tmp = delta / "plan.json.tmp"
+    with tmp.open("w") as f:
+        json.dump(plan, f, indent=1)
+    tmp.replace(delta / "plan.json")
+
+
+def _resumable_plan(delta, since):
+    """The plan of an unfinished fetch from `since`, or None.
+
+    `since` is the cache's last_mod for a delta, None for a full fetch. Only
+    a fetch with the same start can resume: its pages are offsets into
+    exactly that window.
+    """
+    try:
+        with (delta / "plan.json").open() as f:
+            plan = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return plan if plan.get("since") == since else None
 
 
 def merge_raw(raw_dir, delta_dir, full=False):
@@ -1506,31 +1604,35 @@ def refresh_raw(raw_dir, full=False):
     when there is no cache, it is too old for a delta, or full=True. last_mod
     is the time the fetch STARTED, so a record changed during the fetch is
     fetched again next time rather than missed.
+
+    A fetch that fails keeps its pages and its plan (delta/plan.json: the
+    window and the planned counts). The next call from the same last_mod
+    resumes it: same window, only the missing pages.
     """
     raw_dir = Path(raw_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
     meta = read_raw_meta(raw_dir)
     started = datetime.now(timezone.utc)
+    since = meta["last_mod"] if raw_delta_window(meta, started, full) else None
+    delta = raw_dir / "delta"
+    plan = _resumable_plan(delta, since)
+    if plan:
+        started = datetime.fromisoformat(plan["until"])
+        print(f"[*] Resuming the fetch started {plan['until']}")
+        for tmp in delta.glob("*.tmp"):
+            tmp.unlink()
+    else:
+        shutil.rmtree(delta, ignore_errors=True)
+        delta.mkdir()
+        plan = {"since": since, "until": started.isoformat(), "totals": {}}
+        _write_plan(delta, plan)
     window = raw_delta_window(meta, started, full)
     if window:
         print(f"[*] Raw cache delta since {meta['last_mod']}")
     else:
         print("[*] Raw cache full fetch")
-    delta = raw_dir / "delta"
-    shutil.rmtree(delta, ignore_errors=True)
-    delta.mkdir()
     for kind in ("cpes", "cves"):
-        total = nvd_get_json(
-            f"{URL['nvd'].format(kind, 0)}&resultsPerPage=1{window}"
-        )["totalResults"]
-        print(f"[+] Metadata: {total} {kind.upper()}")
-        per_page = CONST[kind[:-1]]
-        jobs = [
-            (f"{URL['nvd'].format(kind, idx)}{window}", kind,
-             delta / f"{kind}_{idx:09d}")
-            for idx in range(0, total, per_page)
-        ]
-        _fetch_raw_pages(jobs, kind)
+        _fetch_raw_kind(kind, window, delta, plan)
     counts = merge_raw(raw_dir, delta, full=not window)
     shutil.rmtree(delta)
     meta = dict(meta or {})
